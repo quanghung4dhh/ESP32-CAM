@@ -1,9 +1,20 @@
 
 #include <Arduino.h>
+#include <HTTPClient.h>
+#include <WiFi.h>
+#include <esp_camera.h>
 
-#include "esp_camera.h"
+#include "secrets.h"
+#include "wifi_manager.h"
 
-// Pin configuration for AI Thinker ESP32-CAM
+// ==========================================
+// SERVER CONFIGURATION
+// ==========================================
+
+// ==========================================
+// CAMERA PIN CONFIGURATION - AI THINKER
+// ==========================================
+
 #define PWDN_GPIO_NUM 32
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM 0
@@ -22,6 +33,10 @@
 #define VSYNC_GPIO_NUM 25
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
+
+// ==========================================
+// CAMERA INITIALIZATION
+// ==========================================
 
 bool initCamera() {
   camera_config_t config = {};
@@ -73,16 +88,85 @@ bool initCamera() {
   return true;
 }
 
+// ==========================================
+// IMAGE UPLOAD
+// ==========================================
+
+bool uploadImage(uint8_t* imageData, size_t imageLength) {
+  if (!isWiFiConnected()) {
+    Serial.println("Wi-Fi disconnected. Cannot upload image.");
+    return false;
+  }
+
+  HTTPClient http;
+
+  Serial.println("Connecting to Flask Server...");
+  Serial.println(SERVER_URL);
+  Serial.print("WiFi status: ");
+  Serial.println(WiFi.status());
+  Serial.print("ESP32-CAM IP: ");
+  Serial.println(WiFi.localIP());
+
+
+
+  http.begin(SERVER_URL);
+  http.addHeader("Content-Type", "image/jpeg");
+
+  http.setConnectTimeout(10000);
+  http.setTimeout(15000);
+
+  int httpCode = http.POST(imageData, imageLength);
+
+  if (httpCode > 0) {
+    Serial.printf("HTTP Response Code: %d\n", httpCode);
+
+    if (httpCode == HTTP_CODE_OK) {
+      String response = http.getString();
+      Serial.println("Image uploaded successfully!");
+      Serial.println(response);
+    } else {
+      Serial.println("Server returned an error.");
+    }
+  } else {
+    Serial.printf("HTTP request failed: %s\n",
+                  http.errorToString(httpCode).c_str());
+  }
+
+  http.end();
+
+  return httpCode == HTTP_CODE_OK;
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+
+bool cameraReady = false;
+
 void setup() {
   Serial.begin(115200);
   delay(2000);
 
   Serial.println();
-  Serial.println("===== ESP32-CAM CAMERA TEST =====");
+  Serial.println("===== ESP32-CAM INITIALIZATION =====");
 
-  Serial.printf("PSRAM: %s\n", psramFound() ? "Available" : "Not found");
+  Serial.printf("PSRAM: %s\n",
+                psramFound() ? "Available" : "Not found");
 
-  if (!initCamera()) {
+  // Initialize Wi-Fi
+  if (!initWiFi()) {
+    Serial.println("Wi-Fi initialization failed!");
+  }
+
+  Serial.print("ESP32-CAM IP: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.print("Server URL: ");
+  Serial.println(SERVER_URL);
+  // Initialize camera
+  cameraReady = initCamera();
+
+  if (!cameraReady) {
     Serial.println("Camera initialization FAILED!");
     return;
   }
@@ -90,7 +174,27 @@ void setup() {
   Serial.println("Camera initialized successfully!");
 }
 
+// ==========================================
+// MAIN LOOP
+// ==========================================
+
 void loop() {
+  maintainWiFi();
+
+  if (!cameraReady) {
+    delay(1000);
+    return;
+  }
+
+  if (!isWiFiConnected()) {
+    delay(1000);
+    return;
+  }
+
+  Serial.println();
+  Serial.println("===== CAPTURING IMAGE =====");
+
+  // Capture RGB565 frame
   camera_fb_t* fb = esp_camera_fb_get();
 
   if (!fb) {
@@ -99,32 +203,37 @@ void loop() {
     return;
   }
 
-  Serial.printf(
-      "RGB565 image: %u bytes, %u x %u\n",
-      (unsigned int)fb->len,
-      fb->width,
-      fb->height);
+  Serial.printf("RGB565: %u bytes, %u x %u\n",
+                (unsigned int)fb->len,
+                fb->width,
+                fb->height);
 
+  // Convert RGB565 to JPEG
   uint8_t* jpg_buf = nullptr;
   size_t jpg_len = 0;
 
-  // Convert RGB565 frame to JPEG
-  bool converted = frame2jpg(
-      fb,
-      12,
-      &jpg_buf,
-      &jpg_len);
+  bool converted = frame2jpg(fb, 12, &jpg_buf, &jpg_len);
 
-  if (converted) {
-    Serial.println("JPEG conversion successful!");
-    Serial.printf("JPEG size: %u bytes\n", (unsigned int)jpg_len);
+  // Return camera frame buffer after conversion
+  esp_camera_fb_return(fb);
 
-    free(jpg_buf);
-  } else {
+  if (!converted || jpg_buf == nullptr) {
     Serial.println("JPEG conversion FAILED!");
+    delay(5000);
+    return;
   }
 
-  esp_camera_fb_return(fb);
+  Serial.printf("JPEG size: %u bytes\n",
+                (unsigned int)jpg_len);
+
+  // Upload JPEG to Flask Server
+  uploadImage(jpg_buf, jpg_len);
+
+  // Release JPEG memory after HTTP request
+  free(jpg_buf);
+  jpg_buf = nullptr;
+
+  Serial.println("Image processing completed.");
 
   delay(5000);
 }
