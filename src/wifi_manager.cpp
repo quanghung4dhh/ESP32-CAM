@@ -1,9 +1,7 @@
 
 #include "wifi_manager.h"
 
-// Wi-Fi credentials
-const char* WIFI_SSID = "NAME";
-const char* WIFI_PASSWORD = "MK";
+#include "secrets.h"
 
 // Connection settings
 const unsigned long WIFI_TIMEOUT = 15000;
