@@ -2,14 +2,27 @@
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <WiFiClient.h>
 #include <esp_camera.h>
 
 #include "secrets.h"
 #include "wifi_manager.h"
 
 // ==========================================
-// SERVER CONFIGURATION
+// TUNING
 // ==========================================
+
+static const uint32_t CAPTURE_INTERVAL_MS = 5000;
+
+// HTTP timeouts
+static const int32_t HTTP_CONNECT_TIMEOUT_MS = 8000;
+static const uint16_t HTTP_READ_TIMEOUT_MS = 15000;
+
+// Retry policy
+static const int UPLOAD_MAX_ATTEMPTS = 3;               // per captured frame
+static const uint32_t UPLOAD_RETRY_BASE_DELAY_MS = 1500;  // grows per attempt
+static const int FAILS_BEFORE_WIFI_RESET = 3;           // failed frames in a row
+static const int FAILS_BEFORE_REBOOT = 10;              // failed frames in a row
 
 // ==========================================
 // CAMERA PIN CONFIGURATION - AI THINKER
@@ -64,19 +77,25 @@ bool initCamera() {
   config.pin_reset = RESET_GPIO_NUM;
 
   config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_RGB565;
 
+  // Let the OV2640 hardware JPEG encoder do the work. Previously the frame
+  // was captured as RGB565 (153 KB at QVGA) and converted on the CPU with
+  // frame2jpg(): slow, and it needs ~150 KB + the JPEG buffer in RAM at the
+  // same time, which fragments the heap and fails randomly when PSRAM is
+  // missing/not enabled. A native JPEG frame is only a few KB.
+  config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
+  config.jpeg_quality = 12;  // 0-63, lower = better quality / bigger file
 
   if (psramFound()) {
     config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;  // always return the newest frame
   } else {
     config.fb_location = CAMERA_FB_IN_DRAM;
+    config.fb_count = 1;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   }
-
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
   esp_err_t err = esp_camera_init(&config);
 
@@ -92,49 +111,86 @@ bool initCamera() {
 // IMAGE UPLOAD
 // ==========================================
 
-bool uploadImage(uint8_t* imageData, size_t imageLength) {
-  if (!isWiFiConnected()) {
-    Serial.println("Wi-Fi disconnected. Cannot upload image.");
-    return false;
-  }
+enum class UploadResult {
+  Success,
+  NetworkError,    // could not reach the server / timeout -> worth retrying
+  ServerRejected,  // server answered with a non-200 status -> do not retry
+};
 
+// One HTTP POST attempt
+static UploadResult uploadOnce(uint8_t* imageData, size_t imageLength) {
+  WiFiClient client;  // must outlive http
   HTTPClient http;
 
-  Serial.println("Connecting to Flask Server...");
-  Serial.println(SERVER_URL);
-  Serial.print("WiFi status: ");
-  Serial.println(WiFi.status());
-  Serial.print("ESP32-CAM IP: ");
-  Serial.println(WiFi.localIP());
+  if (!http.begin(client, SERVER_URL)) {
+    Serial.println("http.begin() failed - check SERVER_URL in secrets.h");
+    return UploadResult::NetworkError;
+  }
 
-
-
-  http.begin(SERVER_URL);
+  http.setReuse(false);  // sends "Connection: close", no stale keep-alive socket
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_READ_TIMEOUT_MS);
   http.addHeader("Content-Type", "image/jpeg");
-
-  http.setConnectTimeout(10000);
-  http.setTimeout(15000);
 
   int httpCode = http.POST(imageData, imageLength);
 
-  if (httpCode > 0) {
-    Serial.printf("HTTP Response Code: %d\n", httpCode);
+  UploadResult result;
 
-    if (httpCode == HTTP_CODE_OK) {
-      String response = http.getString();
-      Serial.println("Image uploaded successfully!");
-      Serial.println(response);
-    } else {
-      Serial.println("Server returned an error.");
-    }
+  if (httpCode == HTTP_CODE_OK) {
+    Serial.printf("Image uploaded successfully! Server says: %s\n",
+                  http.getString().c_str());
+    result = UploadResult::Success;
+  } else if (httpCode > 0) {
+    Serial.printf("Server returned HTTP %d\n", httpCode);
+    result = UploadResult::ServerRejected;
   } else {
-    Serial.printf("HTTP request failed: %s\n",
+    // -1 = connection failed (refused, unreachable OR connect timeout)
+    // -11 = read timeout (server accepted the data but never answered)
+    Serial.printf("HTTP request failed: %d (%s)\n",
+                  httpCode,
                   http.errorToString(httpCode).c_str());
+    result = UploadResult::NetworkError;
   }
 
   http.end();
+  return result;
+}
 
-  return httpCode == HTTP_CODE_OK;
+// Upload with retries and diagnostics
+static UploadResult uploadImage(uint8_t* imageData, size_t imageLength) {
+  for (int attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
+    if (!isWiFiConnected()) {
+      Serial.println("Wi-Fi disconnected. Waiting before retry...");
+      maintainWiFi();
+      delay(UPLOAD_RETRY_BASE_DELAY_MS * attempt);
+      continue;
+    }
+
+    Serial.printf("Upload attempt %d/%d -> %s\n",
+                  attempt, UPLOAD_MAX_ATTEMPTS, SERVER_URL);
+    Serial.printf("  IP: %s | RSSI: %d dBm | free heap: %u bytes\n",
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.RSSI(),
+                  (unsigned int)ESP.getFreeHeap());
+
+    UploadResult result = uploadOnce(imageData, imageLength);
+
+    if (result != UploadResult::NetworkError) {
+      return result;
+    }
+
+    if (attempt < UPLOAD_MAX_ATTEMPTS) {
+      delay(UPLOAD_RETRY_BASE_DELAY_MS * attempt);
+    }
+  }
+
+  return UploadResult::NetworkError;
+}
+
+// A JPEG always starts with the SOI marker FF D8
+static bool isValidJpeg(const camera_fb_t* fb) {
+  return fb->format == PIXFORMAT_JPEG && fb->len > 100 &&
+         fb->buf[0] == 0xFF && fb->buf[1] == 0xD8;
 }
 
 // ==========================================
@@ -142,6 +198,7 @@ bool uploadImage(uint8_t* imageData, size_t imageLength) {
 // ==========================================
 
 bool cameraReady = false;
+int consecutiveFailures = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -155,7 +212,7 @@ void setup() {
 
   // Initialize Wi-Fi
   if (!initWiFi()) {
-    Serial.println("Wi-Fi initialization failed!");
+    Serial.println("Wi-Fi initialization failed! Will keep retrying in loop().");
   }
 
   Serial.print("ESP32-CAM IP: ");
@@ -163,12 +220,22 @@ void setup() {
 
   Serial.print("Server URL: ");
   Serial.println(SERVER_URL);
-  // Initialize camera
-  cameraReady = initCamera();
+
+  // Initialize camera (a cold start on a weak supply sometimes needs a retry)
+  for (int attempt = 1; attempt <= 3 && !cameraReady; attempt++) {
+    cameraReady = initCamera();
+
+    if (!cameraReady) {
+      Serial.printf("Camera init attempt %d/3 failed\n", attempt);
+      esp_camera_deinit();
+      delay(1000);
+    }
+  }
 
   if (!cameraReady) {
-    Serial.println("Camera initialization FAILED!");
-    return;
+    Serial.println("Camera initialization FAILED! Restarting in 5 s...");
+    delay(5000);
+    ESP.restart();
   }
 
   Serial.println("Camera initialized successfully!");
@@ -181,11 +248,6 @@ void setup() {
 void loop() {
   maintainWiFi();
 
-  if (!cameraReady) {
-    delay(1000);
-    return;
-  }
-
   if (!isWiFiConnected()) {
     delay(1000);
     return;
@@ -194,7 +256,7 @@ void loop() {
   Serial.println();
   Serial.println("===== CAPTURING IMAGE =====");
 
-  // Capture RGB565 frame
+  // Capture a JPEG frame straight from the sensor
   camera_fb_t* fb = esp_camera_fb_get();
 
   if (!fb) {
@@ -203,37 +265,40 @@ void loop() {
     return;
   }
 
-  Serial.printf("RGB565: %u bytes, %u x %u\n",
+  if (!isValidJpeg(fb)) {
+    Serial.printf("Invalid frame (format=%d, len=%u), skipping.\n",
+                  (int)fb->format, (unsigned int)fb->len);
+    esp_camera_fb_return(fb);
+    delay(1000);
+    return;
+  }
+
+  Serial.printf("JPEG: %u bytes, %u x %u\n",
                 (unsigned int)fb->len,
                 fb->width,
                 fb->height);
 
-  // Convert RGB565 to JPEG
-  uint8_t* jpg_buf = nullptr;
-  size_t jpg_len = 0;
+  // Upload the frame buffer directly - no extra copy or conversion
+  UploadResult result = uploadImage(fb->buf, fb->len);
 
-  bool converted = frame2jpg(fb, 12, &jpg_buf, &jpg_len);
-
-  // Return camera frame buffer after conversion
   esp_camera_fb_return(fb);
 
-  if (!converted || jpg_buf == nullptr) {
-    Serial.println("JPEG conversion FAILED!");
-    delay(5000);
-    return;
+  if (result == UploadResult::Success) {
+    consecutiveFailures = 0;
+  } else if (result == UploadResult::NetworkError) {
+    consecutiveFailures++;
+    Serial.printf("Upload failed (%d in a row)\n", consecutiveFailures);
+
+    if (consecutiveFailures >= FAILS_BEFORE_REBOOT) {
+      Serial.println("Too many failures - rebooting.");
+      delay(500);
+      ESP.restart();
+    } else if (consecutiveFailures % FAILS_BEFORE_WIFI_RESET == 0) {
+      forceReconnectWiFi();
+    }
   }
-
-  Serial.printf("JPEG size: %u bytes\n",
-                (unsigned int)jpg_len);
-
-  // Upload JPEG to Flask Server
-  uploadImage(jpg_buf, jpg_len);
-
-  // Release JPEG memory after HTTP request
-  free(jpg_buf);
-  jpg_buf = nullptr;
 
   Serial.println("Image processing completed.");
 
-  delay(5000);
+  delay(CAPTURE_INTERVAL_MS);
 }

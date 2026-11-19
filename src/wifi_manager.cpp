@@ -16,7 +16,15 @@ bool initWiFi() {
   Serial.println();
   Serial.println("===== WIFI INITIALIZATION =====");
 
+  // Do not write credentials to flash on every WiFi.begin()
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+
+  // IMPORTANT: the ESP32 enables modem-sleep by default. In that mode the
+  // radio sleeps between AP beacons, which causes delayed/dropped TCP packets
+  // and is a classic source of random "read timeout" / "connection refused"
+  // errors on HTTPClient. Streaming a camera frame needs a continuous link.
+  WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
 
   Serial.print("Connecting to: ");
@@ -35,6 +43,10 @@ bool initWiFi() {
     Serial.print(".");
     delay(500);
   }
+
+  // Re-apply after association: some core versions reset the power-save mode
+  // when the station starts.
+  WiFi.setSleep(false);
 
   Serial.println();
   Serial.println("Wi-Fi connected successfully!");
@@ -62,6 +74,12 @@ IPAddress getLocalIP() {
 // Maintain connection and reconnect when disconnected
 void maintainWiFi() {
   if (isWiFiConnected()) {
+    if (reconnecting) {
+      // Link just came back: restore the no-sleep setting and report it
+      WiFi.setSleep(false);
+      Serial.print("Wi-Fi reconnected, IP: ");
+      Serial.println(WiFi.localIP());
+    }
     reconnecting = false;
     return;
   }
@@ -79,4 +97,16 @@ void maintainWiFi() {
     lastReconnectAttempt = currentTime;
     reconnecting = true;
   }
+}
+
+// Force a clean reconnect (stale association, bad DHCP lease, etc.)
+void forceReconnectWiFi() {
+  Serial.println("Forcing Wi-Fi reconnect...");
+
+  WiFi.disconnect();
+  delay(200);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  lastReconnectAttempt = millis();
+  reconnecting = true;
 }
