@@ -51,7 +51,11 @@ static const int FAILS_BEFORE_REBOOT = 10;              // failed frames in a ro
 // CAMERA INITIALIZATION
 // ==========================================
 
-bool initCamera() {
+// true  = sensor outputs JPEG natively (OV2640 etc.)
+// false = sensor only supports RGB565, frames are converted with frame2jpg()
+static bool useNativeJpeg = true;
+
+bool initCamera(bool nativeJpeg) {
   camera_config_t config = {};
 
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -78,19 +82,26 @@ bool initCamera() {
 
   config.xclk_freq_hz = 20000000;
 
-  // Let the OV2640 hardware JPEG encoder do the work. Previously the frame
-  // was captured as RGB565 (153 KB at QVGA) and converted on the CPU with
-  // frame2jpg(): slow, and it needs ~150 KB + the JPEG buffer in RAM at the
-  // same time, which fragments the heap and fails randomly when PSRAM is
-  // missing/not enabled. A native JPEG frame is only a few KB.
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_QVGA;
+  // Prefer the sensor's hardware JPEG encoder: a native JPEG frame is only a
+  // few KB, while RGB565 at QVGA is ~150 KB and must be converted on the CPU
+  // (slow, fragments the heap). If the sensor cannot output JPEG, initCamera()
+  // is called again with nativeJpeg=false and uses the RGB565 path.
   config.jpeg_quality = 12;  // 0-63, lower = better quality / bigger file
+
+  if (nativeJpeg) {
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size = FRAMESIZE_QVGA;
+  } else {
+    // Fallback for sensors without JPEG output ("JPEG format is not
+    // supported on this sensor", error 0x106)
+    config.pixel_format = PIXFORMAT_RGB565;
+    config.frame_size = psramFound() ? FRAMESIZE_QVGA : FRAMESIZE_QQVGA;
+  }
 
   if (psramFound()) {
     config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.fb_count = 2;
-    config.grab_mode = CAMERA_GRAB_LATEST;  // always return the newest frame
+    config.fb_count = nativeJpeg ? 2 : 1;
+    config.grab_mode = nativeJpeg ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
   } else {
     config.fb_location = CAMERA_FB_IN_DRAM;
     config.fb_count = 1;
@@ -100,10 +111,18 @@ bool initCamera() {
   esp_err_t err = esp_camera_init(&config);
 
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed! Error: 0x%x\n", err);
+    Serial.printf("Camera init (%s) failed! Error: 0x%x\n",
+                  nativeJpeg ? "JPEG" : "RGB565", err);
     return false;
   }
 
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    Serial.printf("Camera sensor PID: 0x%x, mode: %s\n",
+                  s->id.PID, nativeJpeg ? "native JPEG" : "RGB565->JPEG");
+  }
+
+  useNativeJpeg = nativeJpeg;
   return true;
 }
 
@@ -222,8 +241,15 @@ void setup() {
   Serial.println(SERVER_URL);
 
   // Initialize camera (a cold start on a weak supply sometimes needs a retry)
+  // Try native JPEG first, then fall back to RGB565 if the sensor can't do it
   for (int attempt = 1; attempt <= 3 && !cameraReady; attempt++) {
-    cameraReady = initCamera();
+    cameraReady = initCamera(true);
+
+    if (!cameraReady) {
+      esp_camera_deinit();
+      Serial.println("Native JPEG not available, trying RGB565...");
+      cameraReady = initCamera(false);
+    }
 
     if (!cameraReady) {
       Serial.printf("Camera init attempt %d/3 failed\n", attempt);
@@ -265,23 +291,55 @@ void loop() {
     return;
   }
 
-  if (!isValidJpeg(fb)) {
-    Serial.printf("Invalid frame (format=%d, len=%u), skipping.\n",
-                  (int)fb->format, (unsigned int)fb->len);
+  uint8_t* jpgBuf = nullptr;  // only used in RGB565 fallback mode
+  size_t jpgLen = 0;
+  uint8_t* sendBuf = nullptr;
+  size_t sendLen = 0;
+
+  if (useNativeJpeg) {
+    if (!isValidJpeg(fb)) {
+      Serial.printf("Invalid frame (format=%d, len=%u), skipping.\n",
+                    (int)fb->format, (unsigned int)fb->len);
+      esp_camera_fb_return(fb);
+      delay(1000);
+      return;
+    }
+
+    Serial.printf("JPEG: %u bytes, %u x %u\n",
+                  (unsigned int)fb->len, fb->width, fb->height);
+
+    // Upload the frame buffer directly - no extra copy or conversion
+    sendBuf = fb->buf;
+    sendLen = fb->len;
+  } else {
+    Serial.printf("RGB565: %u bytes, %u x %u\n",
+                  (unsigned int)fb->len, fb->width, fb->height);
+
+    bool converted = frame2jpg(fb, 12, &jpgBuf, &jpgLen);
+    // Release the camera buffer right after conversion, before the upload
     esp_camera_fb_return(fb);
-    delay(1000);
-    return;
+    fb = nullptr;
+
+    if (!converted || jpgBuf == nullptr) {
+      Serial.println("JPEG conversion FAILED!");
+      delay(5000);
+      return;
+    }
+
+    Serial.printf("JPEG size: %u bytes\n", (unsigned int)jpgLen);
+    sendBuf = jpgBuf;
+    sendLen = jpgLen;
   }
 
-  Serial.printf("JPEG: %u bytes, %u x %u\n",
-                (unsigned int)fb->len,
-                fb->width,
-                fb->height);
+  UploadResult result = uploadImage(sendBuf, sendLen);
 
-  // Upload the frame buffer directly - no extra copy or conversion
-  UploadResult result = uploadImage(fb->buf, fb->len);
-
-  esp_camera_fb_return(fb);
+  if (fb) {
+    esp_camera_fb_return(fb);
+  }
+  if (jpgBuf) {
+    free(jpgBuf);
+    jpgBuf = nullptr;
+  }
 
   if (result == UploadResult::Success) {
     consecutiveFailures = 0;
