@@ -85,6 +85,10 @@ bool initCamera() {
   return true;
 }
 
+// ================= CAMERA CONTROL =================
+
+static float requestedZoom = 1.0f;
+
 // ================= WEB SERVER =================
 
 const char INDEX_HTML[] = R"rawliteral(
@@ -307,6 +311,58 @@ static esp_err_t indexHandler(httpd_req_t* req) {
       HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t controlHandler(httpd_req_t* req) {
+  char query[64];
+  char value[16];
+
+  // Get URL query string
+  if (httpd_req_get_url_query_str(
+          req, query, sizeof(query)) != ESP_OK) {
+    httpd_resp_send_err(
+        req, HTTPD_400_BAD_REQUEST, "Missing query");
+    return ESP_FAIL;
+  }
+
+  // Extract zoom parameter
+  if (httpd_query_key_value(
+          query, "zoom", value, sizeof(value)) != ESP_OK) {
+    httpd_resp_send_err(
+        req, HTTPD_400_BAD_REQUEST, "Missing zoom parameter");
+    return ESP_FAIL;
+  }
+
+  // Convert string to float
+  char* endPtr = nullptr;
+  float zoom = strtof(value, &endPtr);
+
+  // Validate input
+  if (endPtr == value || *endPtr != '\0' ||
+      zoom < 1.0f || zoom > 4.0f) {
+    httpd_resp_send_err(
+        req, HTTPD_400_BAD_REQUEST, "Invalid zoom value");
+    return ESP_FAIL;
+  }
+
+  // Store requested zoom
+  requestedZoom = zoom;
+
+  Serial.printf(
+      "Requested Zoom: %.1fx\n", requestedZoom);
+
+  // Send response
+  char response[64];
+  snprintf(
+      response,
+      sizeof(response),
+      "Zoom updated: %.1fx",
+      requestedZoom);
+
+  httpd_resp_set_type(req, "text/plain");
+
+  return httpd_resp_send(
+      req, response, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t streamHandler(httpd_req_t* req) {
   esp_err_t res = ESP_OK;
 
@@ -414,6 +470,13 @@ void startCameraServer() {
         .user_ctx = nullptr};
 
     httpd_register_uri_handler(controlServer, &indexUri);
+    httpd_uri_t controlUri = {
+        .uri = "/control",
+        .method = HTTP_GET,
+        .handler = controlHandler,
+        .user_ctx = nullptr};
+
+    httpd_register_uri_handler(controlServer, &controlUri);
 
     Serial.println("Control Panel server started on port 80!");
   } else {
