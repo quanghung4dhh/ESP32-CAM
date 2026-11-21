@@ -45,7 +45,7 @@ static const framesize_t CAPTURE_FRAME_SIZE = FRAMESIZE_QVGA;
 //   N = 3 -> 960x720 window
 //   N = 0 -> keep the driver default
 // A wider view may lower the sensor frame rate: try 5, then 4, then 3.
-static const int SENSOR_VIEW_DEN = 5;
+static const int SENSOR_VIEW_DEN = 3;
 
 // Size that is JPEG-encoded and sent to the browser (fixed => the encoding
 // time stays the same no matter what the capture size or zoom is).
