@@ -89,6 +89,64 @@ bool initCamera() {
 
 static float requestedZoom = 1.0f;
 
+// Protect shared zoom value between HTTP server tasks
+static portMUX_TYPE zoomMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Crop the center region of an RGB565 frame
+static uint8_t* cropRGB565(
+    const camera_fb_t* fb,
+    float zoom,
+    camera_fb_t* croppedFb) {
+  if (fb == nullptr || fb->format != PIXFORMAT_RGB565) {
+    return nullptr;
+  }
+
+  // Calculate cropped dimensions
+  uint16_t cropW = (uint16_t)(fb->width / zoom);
+  uint16_t cropH = (uint16_t)(fb->height / zoom);
+
+  if (cropW == 0 || cropH == 0) {
+    return nullptr;
+  }
+
+  // Calculate the center crop position
+  uint16_t startX = (fb->width - cropW) / 2;
+  uint16_t startY = (fb->height - cropH) / 2;
+
+  // RGB565 uses 2 bytes per pixel
+  size_t cropLen = (size_t)cropW * cropH * 2;
+
+  // Allocate crop buffer in PSRAM
+  uint8_t* cropBuf = (uint8_t*)ps_malloc(cropLen);
+
+  if (cropBuf == nullptr) {
+    return nullptr;
+  }
+
+  // Copy the center region row by row
+  for (uint16_t y = 0; y < cropH; y++) {
+    size_t srcOffset =
+        ((size_t)(startY + y) * fb->width + startX) * 2;
+
+    size_t dstOffset = (size_t)y * cropW * 2;
+
+    memcpy(
+        cropBuf + dstOffset,
+        fb->buf + srcOffset,
+        (size_t)cropW * 2);
+  }
+
+  // Create a frame descriptor for the cropped image
+  *croppedFb = *fb;
+
+  croppedFb->buf = cropBuf;
+  croppedFb->len = cropLen;
+  croppedFb->width = cropW;
+  croppedFb->height = cropH;
+
+  return cropBuf;
+}
+
 // ================= WEB SERVER =================
 
 const char INDEX_HTML[] = R"rawliteral(
@@ -366,11 +424,13 @@ static esp_err_t controlHandler(httpd_req_t* req) {
     return ESP_FAIL;
   }
 
-  // Store requested zoom
+  // Store requested zoom safely
+  portENTER_CRITICAL(&zoomMux);
   requestedZoom = zoom;
+  portEXIT_CRITICAL(&zoomMux);
 
   Serial.printf(
-      "Requested Zoom: %.1fx\n", requestedZoom);
+      "Requested Zoom: %.1fx\n", zoom);
 
   // Send response
   char response[64];
