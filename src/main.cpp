@@ -471,10 +471,48 @@ static esp_err_t streamHandler(httpd_req_t* req) {
     uint8_t* jpgBuf = nullptr;
     size_t jpgLen = 0;
 
-    // 2. Convert RGB565 to JPEG
-    bool converted = frame2jpg(fb, 10, &jpgBuf, &jpgLen);
+    // 2. Read current zoom value safely
+    float currentZoom;
 
-    // Camera buffer is no longer needed after conversion
+    portENTER_CRITICAL(&zoomMux);
+    currentZoom = requestedZoom;
+    portEXIT_CRITICAL(&zoomMux);
+
+    // 3. Select frame for JPEG encoding
+    camera_fb_t croppedFb;
+    camera_fb_t* frameToEncode = fb;
+    uint8_t* croppedBuf = nullptr;
+
+    if (currentZoom > 1.01f) {
+      croppedBuf = cropRGB565(fb, currentZoom, &croppedFb);
+
+      if (croppedBuf != nullptr) {
+        frameToEncode = &croppedFb;
+
+        Serial.printf(
+            "Applying Zoom: %.1fx | Crop: %ux%u\n",
+            currentZoom,
+            croppedFb.width,
+            croppedFb.height);
+      } else {
+        Serial.println("Crop failed. Using original frame.");
+      }
+    }
+
+    // 4. Convert selected frame to JPEG
+    bool converted = frame2jpg(
+        frameToEncode,
+        10,
+        &jpgBuf,
+        &jpgLen);
+
+    // Release temporary crop buffer
+    if (croppedBuf != nullptr) {
+      free(croppedBuf);
+      croppedBuf = nullptr;
+    }
+
+    // Return original camera frame buffer
     esp_camera_fb_return(fb);
     fb = nullptr;
 
