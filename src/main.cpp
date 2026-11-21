@@ -1,11 +1,11 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <lwip/sockets.h>
 
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include "secrets.h"
-
 // ================= WIFI CONFIGURATION =================
 
 // ================= AI THINKER ESP32-CAM PINS =================
@@ -483,6 +483,10 @@ static esp_err_t streamHandler(httpd_req_t* req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
 
+  int sock = httpd_req_to_sockfd(req);
+  int one = 1;
+  setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
   // Timing statistics (printed every 30 frames)
   uint32_t tCap = 0, tEnc = 0, tSend = 0, totalBytes = 0, frames = 0;
 
@@ -555,41 +559,34 @@ static esp_err_t streamHandler(httpd_req_t* req) {
 
     uint32_t t2 = micros();
 
-    // 5. Send multipart boundary
-    res = httpd_resp_send_chunk(
-        req, boundary, strlen(boundary));
+    // 5. Send boundary + header + JPEG as ONE chunk
+    uint32_t thisJpgLen = (uint32_t)jpgLen;
 
-    if (res != ESP_OK) {
-      free(jpgBuf);
-      break;
-    }
-
-    // 6. Send JPEG header
-    char header[96];
-
-    int headerLen = snprintf(
-        header,
-        sizeof(header),
+    char head[128];
+    int headLen = snprintf(
+        head, sizeof(head),
+        "\r\n--frame\r\n"
         "Content-Type: image/jpeg\r\n"
         "Content-Length: %u\r\n\r\n",
         (unsigned int)jpgLen);
 
-    res = httpd_resp_send_chunk(req, header, headerLen);
+    size_t packetLen = (size_t)headLen + jpgLen;
+    uint8_t* packet = (uint8_t*)malloc(packetLen);
 
-    // 7. Send JPEG data
-    if (res == ESP_OK) {
-      res = httpd_resp_send_chunk(
-          req,
-          (const char*)jpgBuf,
-          jpgLen);
+    if (packet == nullptr) {
+      free(jpgBuf);
+      res = ESP_FAIL;
+      break;
     }
 
-    // Remember the size BEFORE the buffer is released
-    uint32_t thisJpgLen = (uint32_t)jpgLen;
+    memcpy(packet, head, headLen);
+    memcpy(packet + headLen, jpgBuf, jpgLen);
 
-    // 8. Always release allocated JPEG buffer
     free(jpgBuf);
     jpgBuf = nullptr;
+
+    res = httpd_resp_send_chunk(req, (const char*)packet, packetLen);
+    free(packet);
 
     if (res != ESP_OK) {
       Serial.println("Stream client disconnected");
@@ -606,14 +603,18 @@ static esp_err_t streamHandler(httpd_req_t* req) {
 
     if (++frames >= 30) {
       Serial.printf(
-          "30 frames | chup %u ms | ma hoa %u ms | gui %u ms | %u KB/khung\n",
+          "30 frames | chup %u ms | ma hoa %u ms | gui %u ms | %u KB/khung | heap %u (min %u) | RSSI %d\n",
           (unsigned int)(tCap / 30000),
           (unsigned int)(tEnc / 30000),
           (unsigned int)(tSend / 30000),
-          (unsigned int)(totalBytes / 30 / 1024));
+          (unsigned int)(totalBytes / 30 / 1024),
+          (unsigned int)ESP.getFreeHeap(),
+          (unsigned int)ESP.getMinFreeHeap(),
+          (int)WiFi.RSSI());
 
       tCap = tEnc = tSend = totalBytes = frames = 0;
     }
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 
   return res;
@@ -695,6 +696,7 @@ void setup() {
   // Connect WiFi
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_15dBm);  // sau đó thử WIFI_POWER_8_5dBm
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   Serial.print("Connecting to WiFi");
@@ -715,6 +717,8 @@ void setup() {
   }
 
   Serial.println("WiFi connected!");
+  WiFi.setSleep(false);
+  Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
