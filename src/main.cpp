@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <lwip/sockets.h>
@@ -34,15 +33,95 @@
 // frame2jpg() quality: 0-100, HIGHER = better image (10 gave blocky output)
 static const int JPEG_QUALITY = 50;
 
-// Capture size. A bigger size is sharper (and keeps detail when zooming) but
-// the CPU needs longer to encode each frame, which increases latency.
-// Try FRAMESIZE_VGA (640x480) on boards with PSRAM.
-static const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_QVGA;
+// Size the SENSOR captures. QVGA is the fastest (VGA RGB565 only gave ~2 fps).
+static const framesize_t CAPTURE_FRAME_SIZE = FRAMESIZE_QVGA;
+
+// Field of view of the GC2145 when it captures QVGA (320x240).
+// The driver reads only a small centre window of the 1600x1200 pixel array
+// (looks "zoomed in"). Here the sensor reads a (320*N) x (240*N) window and
+// subsamples it by 1/N, so the output stays 320x240:
+//   N = 5 -> whole 1600x1200 array (widest view)
+//   N = 4 -> 1280x960 window
+//   N = 3 -> 960x720 window
+//   N = 0 -> keep the driver default
+// A wider view may lower the sensor frame rate: try 5, then 4, then 3.
+static const int SENSOR_VIEW_DEN = 5;
+
+// Size that is JPEG-encoded and sent to the browser (fixed => the encoding
+// time stays the same no matter what the capture size or zoom is).
+static const uint16_t OUTPUT_W = 320;
+static const uint16_t OUTPUT_H = 240;
+
+// Wi-Fi transmit power. 15 dBm gave the best results in testing
+// (8.5 dBm was too weak, default 19.5 dBm was worse).
+static const wifi_power_t WIFI_TX_POWER = WIFI_POWER_15dBm;
 
 // Frames discarded after init so auto exposure / white balance can settle
 static const int WARMUP_FRAMES = 3;
 
 // ================= CAMERA INITIALIZATION =================
+
+// Widen the GC2145 field of view at QVGA by programming its window and
+// subsample registers directly (same registers the esp32-camera driver uses
+// in SUBSAMPLE mode, but with a smaller ratio = bigger window).
+static void setSensorView(int den) {
+  sensor_t* s = esp_camera_sensor_get();
+
+  // 0x2145 = GC2145 product ID
+  if (s == nullptr || s->id.PID != 0x2145 || s->set_reg == nullptr) {
+    Serial.println("Sensor view: not a GC2145, skipped");
+    return;
+  }
+
+  if (den < 3 || den > 5) {
+    return;
+  }
+
+  const uint16_t outW = 320;
+  const uint16_t outH = 240;
+  const uint16_t winW = outW * den;  // 960 / 1280 / 1600
+  const uint16_t winH = outH * den;  // 720 /  960 / 1200
+  const uint16_t rowS = (1200 - winH) / 2;
+  const uint16_t colS = (1600 - winW) / 2;
+
+  struct Reg {
+    int reg;
+    int value;
+  };
+
+  const Reg regs[] = {
+      {0xfe, 0x00},  // register page 0
+      {0x90, 0x01},  // crop enable
+      {0x09, rowS >> 8},
+      {0x0a, rowS & 0xff},
+      {0x0b, colS >> 8},
+      {0x0c, colS & 0xff},
+      {0x0d, (winH + 8) >> 8},
+      {0x0e, (winH + 8) & 0xff},
+      {0x0f, (winW + 16) >> 8},
+      {0x10, (winW + 16) & 0xff},
+      {0x99, (den << 4) | den},  // subsample ratio 1/den (0x33 / 0x44 / 0x55)
+      {0x9b, 0x00},
+      {0x9c, 0x00},
+      {0x9d, 0x00},
+      {0x9e, 0x00},
+      {0x9f, 0x00},
+      {0xa0, 0x00},
+      {0xa1, 0x00},
+      {0xa2, 0x00},
+      {0x95, outH >> 8},
+      {0x96, outH & 0xff},
+      {0x97, outW >> 8},
+      {0x98, outW & 0xff},
+  };
+
+  for (const Reg& r : regs) {
+    s->set_reg(s, r.reg, 0xff, r.value);
+  }
+
+  Serial.printf("Sensor view: window %ux%u, subsample 1/%d -> %ux%u\n",
+                winW, winH, den, outW, outH);
+}
 
 bool initCamera() {
   camera_config_t config = {};
@@ -73,7 +152,8 @@ bool initCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_RGB565;
 
-  config.frame_size = STREAM_FRAME_SIZE;
+  // VGA RGB565 needs ~600 KB per buffer, so it only fits in PSRAM
+  config.frame_size = psramFound() ? CAPTURE_FRAME_SIZE : FRAMESIZE_QVGA;
   config.jpeg_quality = 12;  // not used in RGB565 mode (see JPEG_QUALITY)
 
   if (psramFound()) {
@@ -91,6 +171,10 @@ bool initCamera() {
   if (err != ESP_OK) {
     Serial.printf("Camera initialization failed: 0x%x\n", err);
     return false;
+  }
+
+  if (SENSOR_VIEW_DEN != 0 && config.frame_size == FRAMESIZE_QVGA) {
+    setSensorView(SENSOR_VIEW_DEN);
   }
 
   // Discard the first frames: exposure and white balance are not stable yet
@@ -113,63 +197,70 @@ static float requestedZoom = 1.0f;
 // Protect shared zoom value between HTTP server tasks
 static portMUX_TYPE zoomMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Crop the center region of an RGB565 frame
-static uint8_t* cropRGB565(
+// Take the centre region (frame size / zoom) of an RGB565 frame and resample
+// it (nearest neighbour) to OUTPUT_W x OUTPUT_H.
+// At zoom 1.0 this is the whole sensor image (full field of view); when the
+// sensor captures more pixels than the output, zooming keeps real detail.
+static uint8_t* cropAndScaleRGB565(
     const camera_fb_t* fb,
     float zoom,
-    camera_fb_t* croppedFb) {
+    camera_fb_t* outFb) {
   if (fb == nullptr || fb->format != PIXFORMAT_RGB565) {
     return nullptr;
   }
 
-  // Calculate cropped dimensions
-  uint16_t cropW = (uint16_t)(fb->width / zoom);
-  uint16_t cropH = (uint16_t)(fb->height / zoom);
+  if (zoom < 1.0f) {
+    zoom = 1.0f;
+  }
 
-  // JPEG encoding works in 8x8 blocks: keep the crop size a multiple of 8
-  cropW &= ~7;
-  cropH &= ~7;
+  uint32_t cropW = (uint32_t)(fb->width / zoom);
+  uint32_t cropH = (uint32_t)(fb->height / zoom);
 
-  if (cropW == 0 || cropH == 0) {
+  if (cropW < 8 || cropH < 8) {
     return nullptr;
   }
 
-  // Calculate the center crop position
-  uint16_t startX = (fb->width - cropW) / 2;
-  uint16_t startY = (fb->height - cropH) / 2;
+  uint32_t startX = (fb->width - cropW) / 2;
+  uint32_t startY = (fb->height - cropH) / 2;
 
   // RGB565 uses 2 bytes per pixel
-  size_t cropLen = (size_t)cropW * cropH * 2;
+  size_t outLen = (size_t)OUTPUT_W * OUTPUT_H * 2;
 
-  // Allocate crop buffer in PSRAM
-  uint8_t* cropBuf = (uint8_t*)ps_malloc(cropLen);
+  uint16_t* dst = (uint16_t*)ps_malloc(outLen);
 
-  if (cropBuf == nullptr) {
+  if (dst == nullptr) {
     return nullptr;
   }
 
-  // Copy the center region row by row
-  for (uint16_t y = 0; y < cropH; y++) {
-    size_t srcOffset =
-        ((size_t)(startY + y) * fb->width + startX) * 2;
+  const uint16_t* src = (const uint16_t*)fb->buf;
 
-    size_t dstOffset = (size_t)y * cropW * 2;
+  // Source column for every output column (computed once per frame)
+  uint16_t colMap[OUTPUT_W];
 
-    memcpy(
-        cropBuf + dstOffset,
-        fb->buf + srcOffset,
-        (size_t)cropW * 2);
+  for (uint16_t x = 0; x < OUTPUT_W; x++) {
+    colMap[x] = (uint16_t)(startX + (uint32_t)x * cropW / OUTPUT_W);
   }
 
-  // Create a frame descriptor for the cropped image
-  *croppedFb = *fb;
+  for (uint16_t y = 0; y < OUTPUT_H; y++) {
+    uint32_t sy = startY + (uint32_t)y * cropH / OUTPUT_H;
 
-  croppedFb->buf = cropBuf;
-  croppedFb->len = cropLen;
-  croppedFb->width = cropW;
-  croppedFb->height = cropH;
+    const uint16_t* srcRow = src + (size_t)sy * fb->width;
+    uint16_t* dstRow = dst + (size_t)y * OUTPUT_W;
 
-  return cropBuf;
+    for (uint16_t x = 0; x < OUTPUT_W; x++) {
+      dstRow[x] = srcRow[colMap[x]];
+    }
+  }
+
+  // Frame descriptor for the resampled image
+  *outFb = *fb;
+
+  outFb->buf = (uint8_t*)dst;
+  outFb->len = outLen;
+  outFb->width = OUTPUT_W;
+  outFb->height = OUTPUT_H;
+
+  return (uint8_t*)dst;
 }
 
 // ================= WEB SERVER =================
@@ -474,8 +565,6 @@ static esp_err_t controlHandler(httpd_req_t* req) {
 static esp_err_t streamHandler(httpd_req_t* req) {
   esp_err_t res = ESP_OK;
 
-  const char* boundary = "\r\n--frame\r\n";
-
   httpd_resp_set_type(
       req,
       "multipart/x-mixed-replace;boundary=frame");
@@ -489,6 +578,7 @@ static esp_err_t streamHandler(httpd_req_t* req) {
 
   // Timing statistics (printed every 30 frames)
   uint32_t tCap = 0, tEnc = 0, tSend = 0, totalBytes = 0, frames = 0;
+  uint32_t windowStart = micros();
 
   while (true) {
     uint32_t t0 = micros();
@@ -519,13 +609,16 @@ static esp_err_t streamHandler(httpd_req_t* req) {
     camera_fb_t* frameToEncode = fb;
     uint8_t* croppedBuf = nullptr;
 
-    if (currentZoom > 1.01f) {
-      croppedBuf = cropRGB565(fb, currentZoom, &croppedFb);
+    // Resample whenever the capture size differs from the output size or
+    // the user zoomed in
+    if (currentZoom > 1.01f ||
+        fb->width != OUTPUT_W || fb->height != OUTPUT_H) {
+      croppedBuf = cropAndScaleRGB565(fb, currentZoom, &croppedFb);
 
       if (croppedBuf != nullptr) {
         frameToEncode = &croppedFb;
       } else {
-        Serial.println("Crop failed. Using original frame.");
+        Serial.println("Resize failed. Using original frame.");
       }
     }
 
@@ -602,8 +695,11 @@ static esp_err_t streamHandler(httpd_req_t* req) {
     totalBytes += thisJpgLen;
 
     if (++frames >= 30) {
+      float fps = 30000000.0f / (float)(micros() - windowStart);
+
       Serial.printf(
-          "30 frames | chup %u ms | ma hoa %u ms | gui %u ms | %u KB/khung | heap %u (min %u) | RSSI %d\n",
+          "30 frames | %.1f fps | chup %u ms | ma hoa %u ms | gui %u ms | %u KB/khung | heap %u (min %u) | RSSI %d\n",
+          fps,
           (unsigned int)(tCap / 30000),
           (unsigned int)(tEnc / 30000),
           (unsigned int)(tSend / 30000),
@@ -613,8 +709,8 @@ static esp_err_t streamHandler(httpd_req_t* req) {
           (int)WiFi.RSSI());
 
       tCap = tEnc = tSend = totalBytes = frames = 0;
+      windowStart = micros();
     }
-    vTaskDelay(pdMS_TO_TICKS(100));
   }
 
   return res;
@@ -696,7 +792,7 @@ void setup() {
   // Connect WiFi
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_15dBm);  // sau đó thử WIFI_POWER_8_5dBm
+  WiFi.setTxPower(WIFI_TX_POWER);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   Serial.print("Connecting to WiFi");
