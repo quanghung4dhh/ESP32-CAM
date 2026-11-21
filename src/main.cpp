@@ -29,6 +29,19 @@
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 
+// ================= TUNING =================
+
+// frame2jpg() quality: 0-100, HIGHER = better image (10 gave blocky output)
+static const int JPEG_QUALITY = 50;
+
+// Capture size. A bigger size is sharper (and keeps detail when zooming) but
+// the CPU needs longer to encode each frame, which increases latency.
+// Try FRAMESIZE_VGA (640x480) on boards with PSRAM.
+static const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_QVGA;
+
+// Frames discarded after init so auto exposure / white balance can settle
+static const int WARMUP_FRAMES = 3;
+
 // ================= CAMERA INITIALIZATION =================
 
 bool initCamera() {
@@ -60,9 +73,8 @@ bool initCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_RGB565;
 
-  // Initial test uses QVGA (320x240)
-  config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 12;
+  config.frame_size = STREAM_FRAME_SIZE;
+  config.jpeg_quality = 12;  // not used in RGB565 mode (see JPEG_QUALITY)
 
   if (psramFound()) {
     config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -79,6 +91,15 @@ bool initCamera() {
   if (err != ESP_OK) {
     Serial.printf("Camera initialization failed: 0x%x\n", err);
     return false;
+  }
+
+  // Discard the first frames: exposure and white balance are not stable yet
+  for (int i = 0; i < WARMUP_FRAMES; i++) {
+    camera_fb_t* warm = esp_camera_fb_get();
+    if (warm) {
+      esp_camera_fb_return(warm);
+    }
+    delay(50);
   }
 
   Serial.println("Camera initialized successfully!");
@@ -104,6 +125,10 @@ static uint8_t* cropRGB565(
   // Calculate cropped dimensions
   uint16_t cropW = (uint16_t)(fb->width / zoom);
   uint16_t cropH = (uint16_t)(fb->height / zoom);
+
+  // JPEG encoding works in 8x8 blocks: keep the crop size a multiple of 8
+  cropW &= ~7;
+  cropH &= ~7;
 
   if (cropW == 0 || cropH == 0) {
     return nullptr;
@@ -458,7 +483,12 @@ static esp_err_t streamHandler(httpd_req_t* req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
 
+  // Timing statistics (printed every 30 frames)
+  uint32_t tCap = 0, tEnc = 0, tSend = 0, totalBytes = 0, frames = 0;
+
   while (true) {
+    uint32_t t0 = micros();
+
     // 1. Capture RGB565 frame
     camera_fb_t* fb = esp_camera_fb_get();
 
@@ -467,6 +497,8 @@ static esp_err_t streamHandler(httpd_req_t* req) {
       res = ESP_FAIL;
       break;
     }
+
+    uint32_t t1 = micros();
 
     uint8_t* jpgBuf = nullptr;
     size_t jpgLen = 0;
@@ -488,12 +520,6 @@ static esp_err_t streamHandler(httpd_req_t* req) {
 
       if (croppedBuf != nullptr) {
         frameToEncode = &croppedFb;
-
-        Serial.printf(
-            "Applying Zoom: %.1fx | Crop: %ux%u\n",
-            currentZoom,
-            croppedFb.width,
-            croppedFb.height);
       } else {
         Serial.println("Crop failed. Using original frame.");
       }
@@ -502,7 +528,7 @@ static esp_err_t streamHandler(httpd_req_t* req) {
     // 4. Convert selected frame to JPEG
     bool converted = frame2jpg(
         frameToEncode,
-        10,
+        JPEG_QUALITY,
         &jpgBuf,
         &jpgLen);
 
@@ -527,11 +553,9 @@ static esp_err_t streamHandler(httpd_req_t* req) {
       break;
     }
 
-    Serial.printf("JPEG generated: %u bytes | Free heap: %u\n",
-                  (unsigned int)jpgLen,
-                  (unsigned int)ESP.getFreeHeap());
+    uint32_t t2 = micros();
 
-    // 3. Send multipart boundary
+    // 5. Send multipart boundary
     res = httpd_resp_send_chunk(
         req, boundary, strlen(boundary));
 
@@ -540,7 +564,7 @@ static esp_err_t streamHandler(httpd_req_t* req) {
       break;
     }
 
-    // 4. Send JPEG header
+    // 6. Send JPEG header
     char header[96];
 
     int headerLen = snprintf(
@@ -552,7 +576,7 @@ static esp_err_t streamHandler(httpd_req_t* req) {
 
     res = httpd_resp_send_chunk(req, header, headerLen);
 
-    // 5. Send JPEG data
+    // 7. Send JPEG data
     if (res == ESP_OK) {
       res = httpd_resp_send_chunk(
           req,
@@ -560,13 +584,35 @@ static esp_err_t streamHandler(httpd_req_t* req) {
           jpgLen);
     }
 
-    // 6. Always release allocated JPEG buffer
+    // Remember the size BEFORE the buffer is released
+    uint32_t thisJpgLen = (uint32_t)jpgLen;
+
+    // 8. Always release allocated JPEG buffer
     free(jpgBuf);
     jpgBuf = nullptr;
 
     if (res != ESP_OK) {
       Serial.println("Stream client disconnected");
       break;
+    }
+
+    // 9. Statistics
+    uint32_t t3 = micros();
+
+    tCap += t1 - t0;
+    tEnc += t2 - t1;
+    tSend += t3 - t2;
+    totalBytes += thisJpgLen;
+
+    if (++frames >= 30) {
+      Serial.printf(
+          "30 frames | chup %u ms | ma hoa %u ms | gui %u ms | %u KB/khung\n",
+          (unsigned int)(tCap / 30000),
+          (unsigned int)(tEnc / 30000),
+          (unsigned int)(tSend / 30000),
+          (unsigned int)(totalBytes / 30 / 1024));
+
+      tCap = tEnc = tSend = totalBytes = frames = 0;
     }
   }
 
@@ -580,6 +626,7 @@ void startCameraServer() {
   controlConfig.server_port = 80;
   controlConfig.ctrl_port = 32768;
   controlConfig.max_uri_handlers = 4;
+  controlConfig.lru_purge_enable = true;  // free stale sockets automatically
 
   httpd_handle_t controlServer = nullptr;
 
@@ -611,6 +658,7 @@ void startCameraServer() {
   streamConfig.server_port = 81;
   streamConfig.ctrl_port = 32769;
   streamConfig.max_uri_handlers = 4;
+  streamConfig.lru_purge_enable = true;  // free stale sockets automatically
 
   httpd_handle_t streamServer = nullptr;
 
