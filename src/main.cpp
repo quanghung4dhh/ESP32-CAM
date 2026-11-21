@@ -1,32 +1,14 @@
 
 #include <Arduino.h>
-#include <HTTPClient.h>
 #include <WiFi.h>
-#include <WiFiClient.h>
-#include <esp_camera.h>
 
+#include "esp_camera.h"
+#include "esp_http_server.h"
 #include "secrets.h"
-#include "wifi_manager.h"
 
-// ==========================================
-// TUNING
-// ==========================================
+// ================= WIFI CONFIGURATION =================
 
-static const uint32_t CAPTURE_INTERVAL_MS = 5000;
-
-// HTTP timeouts
-static const int32_t HTTP_CONNECT_TIMEOUT_MS = 8000;
-static const uint16_t HTTP_READ_TIMEOUT_MS = 15000;
-
-// Retry policy
-static const int UPLOAD_MAX_ATTEMPTS = 3;               // per captured frame
-static const uint32_t UPLOAD_RETRY_BASE_DELAY_MS = 1500;  // grows per attempt
-static const int FAILS_BEFORE_WIFI_RESET = 3;           // failed frames in a row
-static const int FAILS_BEFORE_REBOOT = 10;              // failed frames in a row
-
-// ==========================================
-// CAMERA PIN CONFIGURATION - AI THINKER
-// ==========================================
+// ================= AI THINKER ESP32-CAM PINS =================
 
 #define PWDN_GPIO_NUM 32
 #define RESET_GPIO_NUM -1
@@ -47,15 +29,9 @@ static const int FAILS_BEFORE_REBOOT = 10;              // failed frames in a ro
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 
-// ==========================================
-// CAMERA INITIALIZATION
-// ==========================================
+// ================= CAMERA INITIALIZATION =================
 
-// true  = sensor outputs JPEG natively (OV2640 etc.)
-// false = sensor only supports RGB565, frames are converted with frame2jpg()
-static bool useNativeJpeg = true;
-
-bool initCamera(bool nativeJpeg) {
+bool initCamera() {
   camera_config_t config = {};
 
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -77,31 +53,21 @@ bool initCamera(bool nativeJpeg) {
 
   config.pin_sccb_sda = SIOD_GPIO_NUM;
   config.pin_sccb_scl = SIOC_GPIO_NUM;
+
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
 
   config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_RGB565;
 
-  // Prefer the sensor's hardware JPEG encoder: a native JPEG frame is only a
-  // few KB, while RGB565 at QVGA is ~150 KB and must be converted on the CPU
-  // (slow, fragments the heap). If the sensor cannot output JPEG, initCamera()
-  // is called again with nativeJpeg=false and uses the RGB565 path.
-  config.jpeg_quality = 12;  // 0-63, lower = better quality / bigger file
-
-  if (nativeJpeg) {
-    config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size = FRAMESIZE_QVGA;
-  } else {
-    // Fallback for sensors without JPEG output ("JPEG format is not
-    // supported on this sensor", error 0x106)
-    config.pixel_format = PIXFORMAT_RGB565;
-    config.frame_size = psramFound() ? FRAMESIZE_QVGA : FRAMESIZE_QQVGA;
-  }
+  // Initial test uses QVGA (320x240)
+  config.frame_size = FRAMESIZE_QVGA;
+  config.jpeg_quality = 12;
 
   if (psramFound()) {
     config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.fb_count = nativeJpeg ? 2 : 1;
-    config.grab_mode = nativeJpeg ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
     config.fb_location = CAMERA_FB_IN_DRAM;
     config.fb_count = 1;
@@ -111,252 +77,197 @@ bool initCamera(bool nativeJpeg) {
   esp_err_t err = esp_camera_init(&config);
 
   if (err != ESP_OK) {
-    Serial.printf("Camera init (%s) failed! Error: 0x%x\n",
-                  nativeJpeg ? "JPEG" : "RGB565", err);
+    Serial.printf("Camera initialization failed: 0x%x\n", err);
     return false;
   }
 
-  sensor_t* s = esp_camera_sensor_get();
-  if (s) {
-    Serial.printf("Camera sensor PID: 0x%x, mode: %s\n",
-                  s->id.PID, nativeJpeg ? "native JPEG" : "RGB565->JPEG");
-  }
-
-  useNativeJpeg = nativeJpeg;
+  Serial.println("Camera initialized successfully!");
   return true;
 }
 
-// ==========================================
-// IMAGE UPLOAD
-// ==========================================
+// ================= WEB SERVER =================
 
-enum class UploadResult {
-  Success,
-  NetworkError,    // could not reach the server / timeout -> worth retrying
-  ServerRejected,  // server answered with a non-200 status -> do not retry
-};
+static esp_err_t indexHandler(httpd_req_t* req) {
+  const char html[] =
+      "<!DOCTYPE html>"
+      "<html>"
+      "<head>"
+      "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+      "<title>ESP32-CAM Stream</title>"
+      "</head>"
+      "<body style='text-align:center;font-family:Arial'>"
+      "<h2>ESP32-CAM Live Stream</h2>"
+      "<img src='/stream' style='width:100%;max-width:640px'>"
+      "</body>"
+      "</html>";
 
-// One HTTP POST attempt
-static UploadResult uploadOnce(uint8_t* imageData, size_t imageLength) {
-  WiFiClient client;  // must outlive http
-  HTTPClient http;
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
 
-  if (!http.begin(client, SERVER_URL)) {
-    Serial.println("http.begin() failed - check SERVER_URL in secrets.h");
-    return UploadResult::NetworkError;
+static esp_err_t streamHandler(httpd_req_t* req) {
+  camera_fb_t* fb = nullptr;
+  esp_err_t res = ESP_OK;
+
+  const char* boundary = "\r\n--frame\r\n";
+
+  httpd_resp_set_type(
+      req,
+      "multipart/x-mixed-replace;boundary=frame");
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+
+  while (true) {
+    fb = esp_camera_fb_get();
+
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      res = ESP_FAIL;
+      break;
+    }
+
+    if (fb->format != PIXFORMAT_JPEG) {
+      esp_camera_fb_return(fb);
+      res = ESP_FAIL;
+      break;
+    }
+
+    // Send frame boundary
+    res = httpd_resp_send_chunk(
+        req, boundary, strlen(boundary));
+
+    if (res != ESP_OK) {
+      esp_camera_fb_return(fb);
+      break;
+    }
+
+    // Send frame header
+    char header[64];
+
+    int headerLen = snprintf(
+        header,
+        sizeof(header),
+        "Content-Type: image/jpeg\r\n"
+        "Content-Length: %u\r\n\r\n",
+        (unsigned int)fb->len);
+
+    res = httpd_resp_send_chunk(req, header, headerLen);
+
+    if (res == ESP_OK) {
+      // Send JPEG image
+      res = httpd_resp_send_chunk(
+          req,
+          (const char*)fb->buf,
+          fb->len);
+    }
+
+    esp_camera_fb_return(fb);
+
+    if (res != ESP_OK) {
+      break;
+    }
   }
 
-  http.setReuse(false);  // sends "Connection: close", no stale keep-alive socket
-  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
-  http.setTimeout(HTTP_READ_TIMEOUT_MS);
-  http.addHeader("Content-Type", "image/jpeg");
+  return res;
+}
 
-  int httpCode = http.POST(imageData, imageLength);
+void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
-  UploadResult result;
+  config.server_port = 80;
+  config.max_uri_handlers = 4;
 
-  if (httpCode == HTTP_CODE_OK) {
-    Serial.printf("Image uploaded successfully! Server says: %s\n",
-                  http.getString().c_str());
-    result = UploadResult::Success;
-  } else if (httpCode > 0) {
-    Serial.printf("Server returned HTTP %d\n", httpCode);
-    result = UploadResult::ServerRejected;
+  httpd_handle_t server = nullptr;
+
+  if (httpd_start(&server, &config) == ESP_OK) {
+    httpd_uri_t indexUri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = indexHandler,
+        .user_ctx = nullptr};
+
+    httpd_uri_t streamUri = {
+        .uri = "/stream",
+        .method = HTTP_GET,
+        .handler = streamHandler,
+        .user_ctx = nullptr};
+
+    httpd_register_uri_handler(server, &indexUri);
+    httpd_register_uri_handler(server, &streamUri);
+
+    Serial.println("HTTP camera server started!");
   } else {
-    // -1 = connection failed (refused, unreachable OR connect timeout)
-    // -11 = read timeout (server accepted the data but never answered)
-    Serial.printf("HTTP request failed: %d (%s)\n",
-                  httpCode,
-                  http.errorToString(httpCode).c_str());
-    result = UploadResult::NetworkError;
+    Serial.println("Failed to start HTTP server!");
   }
-
-  http.end();
-  return result;
 }
 
-// Upload with retries and diagnostics
-static UploadResult uploadImage(uint8_t* imageData, size_t imageLength) {
-  for (int attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
-    if (!isWiFiConnected()) {
-      Serial.println("Wi-Fi disconnected. Waiting before retry...");
-      maintainWiFi();
-      delay(UPLOAD_RETRY_BASE_DELAY_MS * attempt);
-      continue;
-    }
-
-    Serial.printf("Upload attempt %d/%d -> %s\n",
-                  attempt, UPLOAD_MAX_ATTEMPTS, SERVER_URL);
-    Serial.printf("  IP: %s | RSSI: %d dBm | free heap: %u bytes\n",
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.RSSI(),
-                  (unsigned int)ESP.getFreeHeap());
-
-    UploadResult result = uploadOnce(imageData, imageLength);
-
-    if (result != UploadResult::NetworkError) {
-      return result;
-    }
-
-    if (attempt < UPLOAD_MAX_ATTEMPTS) {
-      delay(UPLOAD_RETRY_BASE_DELAY_MS * attempt);
-    }
-  }
-
-  return UploadResult::NetworkError;
-}
-
-// A JPEG always starts with the SOI marker FF D8
-static bool isValidJpeg(const camera_fb_t* fb) {
-  return fb->format == PIXFORMAT_JPEG && fb->len > 100 &&
-         fb->buf[0] == 0xFF && fb->buf[1] == 0xD8;
-}
-
-// ==========================================
-// SETUP
-// ==========================================
-
-bool cameraReady = false;
-int consecutiveFailures = 0;
+// ================= SETUP =================
 
 void setup() {
   Serial.begin(115200);
-  delay(2000);
+  Serial.println("\nESP32-CAM Stream Test");
 
-  Serial.println();
-  Serial.println("===== ESP32-CAM INITIALIZATION =====");
+  // Check PSRAM
+  Serial.printf("PSRAM found: %s\n", psramFound() ? "YES" : "NO");
 
-  Serial.printf("PSRAM: %s\n",
-                psramFound() ? "Available" : "Not found");
-
-  // Initialize Wi-Fi
-  if (!initWiFi()) {
-    Serial.println("Wi-Fi initialization failed! Will keep retrying in loop().");
-  }
-
-  Serial.print("ESP32-CAM IP: ");
-  Serial.println(WiFi.localIP());
-
-  Serial.print("Server URL: ");
-  Serial.println(SERVER_URL);
-
-  // Initialize camera (a cold start on a weak supply sometimes needs a retry)
-  // Try native JPEG first, then fall back to RGB565 if the sensor can't do it
-  for (int attempt = 1; attempt <= 3 && !cameraReady; attempt++) {
-    cameraReady = initCamera(true);
-
-    if (!cameraReady) {
-      esp_camera_deinit();
-      Serial.println("Native JPEG not available, trying RGB565...");
-      cameraReady = initCamera(false);
-    }
-
-    if (!cameraReady) {
-      Serial.printf("Camera init attempt %d/3 failed\n", attempt);
-      esp_camera_deinit();
-      delay(1000);
-    }
-  }
-
-  if (!cameraReady) {
-    Serial.println("Camera initialization FAILED! Restarting in 5 s...");
-    delay(5000);
-    ESP.restart();
-  }
-
-  Serial.println("Camera initialized successfully!");
-}
-
-// ==========================================
-// MAIN LOOP
-// ==========================================
-
-void loop() {
-  maintainWiFi();
-
-  if (!isWiFiConnected()) {
-    delay(1000);
+  // Initialize camera
+  if (!initCamera()) {
+    Serial.println("Camera setup failed. Restart required.");
     return;
   }
 
-  Serial.println();
-  Serial.println("===== CAPTURING IMAGE =====");
+  // Connect WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  // Capture a JPEG frame straight from the sensor
+  Serial.print("Connecting to WiFi");
+
+  unsigned long startTime = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startTime < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connection failed!");
+    return;
+  }
+
+  Serial.println("WiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Start web server
+  startCameraServer();
+
+  Serial.println("Open the IP address in your browser.");
+}
+
+// ================= LOOP =================
+
+void loop() {
   camera_fb_t* fb = esp_camera_fb_get();
 
   if (!fb) {
-    Serial.println("Failed to capture image!");
-    delay(3000);
+    Serial.println("Camera capture failed!");
+    delay(2000);
     return;
   }
 
-  uint8_t* jpgBuf = nullptr;  // only used in RGB565 fallback mode
-  size_t jpgLen = 0;
-  uint8_t* sendBuf = nullptr;
-  size_t sendLen = 0;
+  Serial.printf(
+      "Frame: %ux%u | Length: %u bytes | Format: %d\n",
+      fb->width,
+      fb->height,
+      fb->len,
+      fb->format);
 
-  if (useNativeJpeg) {
-    if (!isValidJpeg(fb)) {
-      Serial.printf("Invalid frame (format=%d, len=%u), skipping.\n",
-                    (int)fb->format, (unsigned int)fb->len);
-      esp_camera_fb_return(fb);
-      delay(1000);
-      return;
-    }
+  esp_camera_fb_return(fb);
 
-    Serial.printf("JPEG: %u bytes, %u x %u\n",
-                  (unsigned int)fb->len, fb->width, fb->height);
-
-    // Upload the frame buffer directly - no extra copy or conversion
-    sendBuf = fb->buf;
-    sendLen = fb->len;
-  } else {
-    Serial.printf("RGB565: %u bytes, %u x %u\n",
-                  (unsigned int)fb->len, fb->width, fb->height);
-
-    bool converted = frame2jpg(fb, 12, &jpgBuf, &jpgLen);
-    // Release the camera buffer right after conversion, before the upload
-    esp_camera_fb_return(fb);
-    fb = nullptr;
-
-    if (!converted || jpgBuf == nullptr) {
-      Serial.println("JPEG conversion FAILED!");
-      delay(5000);
-      return;
-    }
-
-    Serial.printf("JPEG size: %u bytes\n", (unsigned int)jpgLen);
-    sendBuf = jpgBuf;
-    sendLen = jpgLen;
-  }
-
-  UploadResult result = uploadImage(sendBuf, sendLen);
-
-  if (fb) {
-    esp_camera_fb_return(fb);
-  }
-  if (jpgBuf) {
-    free(jpgBuf);
-    jpgBuf = nullptr;
-  }
-
-  if (result == UploadResult::Success) {
-    consecutiveFailures = 0;
-  } else if (result == UploadResult::NetworkError) {
-    consecutiveFailures++;
-    Serial.printf("Upload failed (%d in a row)\n", consecutiveFailures);
-
-    if (consecutiveFailures >= FAILS_BEFORE_REBOOT) {
-      Serial.println("Too many failures - rebooting.");
-      delay(500);
-      ESP.restart();
-    } else if (consecutiveFailures % FAILS_BEFORE_WIFI_RESET == 0) {
-      forceReconnectWiFi();
-    }
-  }
-
-  Serial.println("Image processing completed.");
-
-  delay(CAPTURE_INTERVAL_MS);
+  delay(2000);
 }
