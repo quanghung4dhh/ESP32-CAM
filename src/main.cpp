@@ -106,7 +106,6 @@ static esp_err_t indexHandler(httpd_req_t* req) {
 }
 
 static esp_err_t streamHandler(httpd_req_t* req) {
-  camera_fb_t* fb = nullptr;
   esp_err_t res = ESP_OK;
 
   const char* boundary = "\r\n--frame\r\n";
@@ -119,7 +118,8 @@ static esp_err_t streamHandler(httpd_req_t* req) {
   httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
 
   while (true) {
-    fb = esp_camera_fb_get();
+    // 1. Capture RGB565 frame
+    camera_fb_t* fb = esp_camera_fb_get();
 
     if (!fb) {
       Serial.println("Camera capture failed");
@@ -127,44 +127,66 @@ static esp_err_t streamHandler(httpd_req_t* req) {
       break;
     }
 
-    if (fb->format != PIXFORMAT_JPEG) {
-      esp_camera_fb_return(fb);
+    uint8_t* jpgBuf = nullptr;
+    size_t jpgLen = 0;
+
+    // 2. Convert RGB565 to JPEG
+    bool converted = frame2jpg(fb, 80, &jpgBuf, &jpgLen);
+
+    // Camera buffer is no longer needed after conversion
+    esp_camera_fb_return(fb);
+    fb = nullptr;
+
+    if (!converted || jpgBuf == nullptr || jpgLen == 0) {
+      Serial.println("RGB565 to JPEG conversion failed");
+
+      if (jpgBuf != nullptr) {
+        free(jpgBuf);
+      }
+
       res = ESP_FAIL;
       break;
     }
 
-    // Send frame boundary
+    Serial.printf("JPEG generated: %u bytes | Free heap: %u\n",
+                  (unsigned int)jpgLen,
+                  (unsigned int)ESP.getFreeHeap());
+
+    // 3. Send multipart boundary
     res = httpd_resp_send_chunk(
         req, boundary, strlen(boundary));
 
     if (res != ESP_OK) {
-      esp_camera_fb_return(fb);
+      free(jpgBuf);
       break;
     }
 
-    // Send frame header
-    char header[64];
+    // 4. Send JPEG header
+    char header[96];
 
     int headerLen = snprintf(
         header,
         sizeof(header),
         "Content-Type: image/jpeg\r\n"
         "Content-Length: %u\r\n\r\n",
-        (unsigned int)fb->len);
+        (unsigned int)jpgLen);
 
     res = httpd_resp_send_chunk(req, header, headerLen);
 
+    // 5. Send JPEG data
     if (res == ESP_OK) {
-      // Send JPEG image
       res = httpd_resp_send_chunk(
           req,
-          (const char*)fb->buf,
-          fb->len);
+          (const char*)jpgBuf,
+          jpgLen);
     }
 
-    esp_camera_fb_return(fb);
+    // 6. Always release allocated JPEG buffer
+    free(jpgBuf);
+    jpgBuf = nullptr;
 
     if (res != ESP_OK) {
+      Serial.println("Stream client disconnected");
       break;
     }
   }
@@ -252,22 +274,6 @@ void setup() {
 // ================= LOOP =================
 
 void loop() {
-  camera_fb_t* fb = esp_camera_fb_get();
-
-  if (!fb) {
-    Serial.println("Camera capture failed!");
-    delay(2000);
-    return;
-  }
-
-  Serial.printf(
-      "Frame: %ux%u | Length: %u bytes | Format: %d\n",
-      fb->width,
-      fb->height,
-      fb->len,
-      fb->format);
-
-  esp_camera_fb_return(fb);
-
-  delay(2000);
+  // Camera capture is handled by streamHandler().
+  delay(1000);
 }
