@@ -87,8 +87,7 @@ bool initCamera() {
 
 // ================= WEB SERVER =================
 
-static esp_err_t indexHandler(httpd_req_t* req) {
-  const char html[] = R"rawliteral(
+const char INDEX_HTML[] = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -211,6 +210,31 @@ static esp_err_t indexHandler(httpd_req_t* req) {
     <div class="layout">
 
       <section class="card">
+
+<div class="setting">
+  <label for="zoomRange">
+    Digital Zoom:
+    <span id="zoomValue">1.0×</span>
+  </label>
+
+  <input
+    type="range"
+    id="zoomRange"
+    min="1.0"
+    max="4.0"
+    step="0.1"
+    value="1.0"
+    oninput="
+      document.getElementById('zoomValue').textContent =
+      Number(this.value).toFixed(1) + '×';
+    "
+  >
+
+  <p class="note">
+    Adjust digital zoom from 1.0× to 4.0×.
+  </p>
+</div>
+
         <h2>Live Preview</h2>
 
         <div class="preview">
@@ -265,11 +289,12 @@ static esp_err_t indexHandler(httpd_req_t* req) {
 </html>
 )rawliteral";
 
+static esp_err_t indexHandler(httpd_req_t* req) {
   httpd_resp_set_type(req, "text/html");
 
   return httpd_resp_send(
       req,
-      html,
+      INDEX_HTML,
       HTTPD_RESP_USE_STRLEN);
 }
 
