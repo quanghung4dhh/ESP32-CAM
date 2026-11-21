@@ -223,17 +223,18 @@ const char INDEX_HTML[] = R"rawliteral(
   </label>
 
   <input
-    type="range"
-    id="zoomRange"
-    min="1.0"
-    max="4.0"
-    step="0.1"
-    value="1.0"
-    oninput="
-      document.getElementById('zoomValue').textContent =
-      Number(this.value).toFixed(1) + '×';
-    "
-  >
+  type="range"
+  id="zoomRange"
+  min="1.0"
+  max="4.0"
+  step="0.1"
+  value="1.0"
+  oninput="
+    document.getElementById('zoomValue').textContent =
+    Number(this.value).toFixed(1) + '×';
+  "
+  onchange="sendZoom(this.value)"
+>
 
   <p class="note">
     Adjust digital zoom from 1.0× to 4.0×.
@@ -293,10 +294,32 @@ const char INDEX_HTML[] = R"rawliteral(
     </div>
   </div>
   <script>
+  // Initialize camera stream
   const streamUrl =
     'http://' + window.location.hostname + ':81/stream';
 
   document.getElementById('cameraStream').src = streamUrl;
+
+
+  // Send zoom command to ESP32
+  async function sendZoom(value) {
+    try {
+      const response = await fetch(
+        `/control?zoom=${encodeURIComponent(value)}`
+      );
+
+      const message = await response.text();
+
+      if (!response.ok) {
+        throw new Error(message);
+      }
+
+      console.log(message);
+
+    } catch (error) {
+      console.error('Zoom control failed:', error);
+    }
+  }
 </script>
 </body>
 </html>
