@@ -195,6 +195,7 @@ const char INDEX_HTML[] = R"rawliteral(
       }
     }
   </style>
+  
 </head>
 
 <body>
@@ -238,7 +239,9 @@ const char INDEX_HTML[] = R"rawliteral(
         <h2>Live Preview</h2>
 
         <div class="preview">
-          <img src="/stream" alt="Camera Stream">
+          <img id="cameraStream"
+  alt="Camera Stream"
+  style="width: 100%; height: auto;">
         </div>
 
         <p class="note">
@@ -285,6 +288,12 @@ const char INDEX_HTML[] = R"rawliteral(
 
     </div>
   </div>
+  <script>
+  const streamUrl =
+    'http://' + window.location.hostname + ':81/stream';
+
+  document.getElementById('cameraStream').src = streamUrl;
+</script>
 </body>
 </html>
 )rawliteral";
@@ -388,32 +397,51 @@ static esp_err_t streamHandler(httpd_req_t* req) {
 }
 
 void startCameraServer() {
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  // Server 1: Control Panel on port 80
+  httpd_config_t controlConfig = HTTPD_DEFAULT_CONFIG();
 
-  config.server_port = 80;
-  config.max_uri_handlers = 4;
+  controlConfig.server_port = 80;
+  controlConfig.ctrl_port = 32768;
+  controlConfig.max_uri_handlers = 4;
 
-  httpd_handle_t server = nullptr;
+  httpd_handle_t controlServer = nullptr;
 
-  if (httpd_start(&server, &config) == ESP_OK) {
+  if (httpd_start(&controlServer, &controlConfig) == ESP_OK) {
     httpd_uri_t indexUri = {
         .uri = "/",
         .method = HTTP_GET,
         .handler = indexHandler,
         .user_ctx = nullptr};
 
+    httpd_register_uri_handler(controlServer, &indexUri);
+
+    Serial.println("Control Panel server started on port 80!");
+  } else {
+    Serial.println("Failed to start Control Panel server!");
+    return;
+  }
+
+  // Server 2: Video stream on port 81
+  httpd_config_t streamConfig = HTTPD_DEFAULT_CONFIG();
+
+  streamConfig.server_port = 81;
+  streamConfig.ctrl_port = 32769;
+  streamConfig.max_uri_handlers = 4;
+
+  httpd_handle_t streamServer = nullptr;
+
+  if (httpd_start(&streamServer, &streamConfig) == ESP_OK) {
     httpd_uri_t streamUri = {
         .uri = "/stream",
         .method = HTTP_GET,
         .handler = streamHandler,
         .user_ctx = nullptr};
 
-    httpd_register_uri_handler(server, &indexUri);
-    httpd_register_uri_handler(server, &streamUri);
+    httpd_register_uri_handler(streamServer, &streamUri);
 
-    Serial.println("HTTP camera server started!");
+    Serial.println("Camera stream server started on port 81!");
   } else {
-    Serial.println("Failed to start HTTP server!");
+    Serial.println("Failed to start camera stream server!");
   }
 }
 
