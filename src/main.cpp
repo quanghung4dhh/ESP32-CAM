@@ -4,6 +4,7 @@
 
 #include "camera/camera_manager.h"
 #include "camera/image_processor.h"
+#include "control/zoom_controller.h"
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include "network/wifi_manager.h"
@@ -34,11 +35,6 @@ static const int JPEG_QUALITY = 50;
 // Frames discarded after init so auto exposure / white balance can settle
 
 // ================= CAMERA CONTROL =================
-
-static float requestedZoom = 1.0f;
-
-// Protect shared zoom value between HTTP server tasks
-static portMUX_TYPE zoomMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Take the centre region (frame size / zoom) of an RGB565 frame and resample
 // it (nearest neighbour) to OUTPUT_W x OUTPUT_H.
@@ -88,10 +84,8 @@ static esp_err_t controlHandler(httpd_req_t* req) {
     return ESP_FAIL;
   }
 
-  // Store requested zoom safely
-  portENTER_CRITICAL(&zoomMux);
-  requestedZoom = zoom;
-  portEXIT_CRITICAL(&zoomMux);
+  // Update requested zoom
+  ZoomController::setZoom(zoom);
 
   Serial.printf(
       "Requested Zoom: %.1fx\n", zoom);
@@ -102,7 +96,7 @@ static esp_err_t controlHandler(httpd_req_t* req) {
       response,
       sizeof(response),
       "Zoom updated: %.1fx",
-      requestedZoom);
+      ZoomController::getZoom());
 
   httpd_resp_set_type(req, "text/plain");
 
@@ -146,11 +140,8 @@ static esp_err_t streamHandler(httpd_req_t* req) {
     size_t jpgLen = 0;
 
     // 2. Read current zoom value safely
-    float currentZoom;
 
-    portENTER_CRITICAL(&zoomMux);
-    currentZoom = requestedZoom;
-    portEXIT_CRITICAL(&zoomMux);
+    float currentZoom = ZoomController::getZoom();
 
     // 3. Select frame for JPEG encoding
     camera_fb_t croppedFb;
