@@ -512,7 +512,12 @@ void startCameraServer() {
 
   httpd_handle_t controlServer = nullptr;
 
-  if (httpd_start(&controlServer, &controlConfig) == ESP_OK) {
+  Serial.println("[DEBUG] Starting control server...");
+  esp_err_t controlErr = httpd_start(&controlServer, &controlConfig);
+
+  Serial.printf("[DEBUG] Control server result: 0x%x\n", controlErr);
+
+  if (controlErr == ESP_OK) {
     httpd_uri_t indexUri = {
         .uri = "/",
         .method = HTTP_GET,
@@ -544,7 +549,12 @@ void startCameraServer() {
 
   httpd_handle_t streamServer = nullptr;
 
-  if (httpd_start(&streamServer, &streamConfig) == ESP_OK) {
+  Serial.println("[DEBUG] Starting stream server...");
+  esp_err_t streamErr = httpd_start(&streamServer, &streamConfig);
+
+  Serial.printf("[DEBUG] Stream server result: 0x%x\n", streamErr);
+
+  if (streamErr == ESP_OK) {
     httpd_uri_t streamUri = {
         .uri = "/stream",
         .method = HTTP_GET,
@@ -574,7 +584,13 @@ void setup() {
     return;
   }
 
-    // Start web server
+  // Initialize Wi-Fi
+  if (!initWiFi()) {
+    Serial.println("Wi-Fi setup failed. Restart required.");
+    return;
+  }
+
+  // Start web server
   startCameraServer();
 
   Serial.println("Open the IP address in your browser.");
