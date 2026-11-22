@@ -3,7 +3,7 @@
 #include <lwip/sockets.h>
 
 #include "camera/camera_manager.h"
-#include "config/camera_pins.h"
+#include "camera/image_processor.h"
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include "secrets.h"
@@ -14,7 +14,6 @@
 static const int JPEG_QUALITY = 50;
 
 // Size the SENSOR captures. QVGA is the fastest (VGA RGB565 only gave ~2 fps).
-static const framesize_t CAPTURE_FRAME_SIZE = FRAMESIZE_QVGA;
 
 // Field of view of the GC2145 when it captures QVGA (320x240).
 // The driver reads only a small centre window of the 1600x1200 pixel array
@@ -25,19 +24,15 @@ static const framesize_t CAPTURE_FRAME_SIZE = FRAMESIZE_QVGA;
 //   N = 3 -> 960x720 window
 //   N = 0 -> keep the driver default
 // A wider view may lower the sensor frame rate: try 5, then 4, then 3.
-static const int SENSOR_VIEW_DEN = 3;
 
 // Size that is JPEG-encoded and sent to the browser (fixed => the encoding
 // time stays the same no matter what the capture size or zoom is).
-static const uint16_t OUTPUT_W = 320;
-static const uint16_t OUTPUT_H = 240;
 
 // Wi-Fi transmit power. 15 dBm gave the best results in testing
 // (8.5 dBm was too weak, default 19.5 dBm was worse).
 static const wifi_power_t WIFI_TX_POWER = WIFI_POWER_15dBm;
 
 // Frames discarded after init so auto exposure / white balance can settle
-static const int WARMUP_FRAMES = 3;
 
 // ================= CAMERA CONTROL =================
 
@@ -50,67 +45,6 @@ static portMUX_TYPE zoomMux = portMUX_INITIALIZER_UNLOCKED;
 // it (nearest neighbour) to OUTPUT_W x OUTPUT_H.
 // At zoom 1.0 this is the whole sensor image (full field of view); when the
 // sensor captures more pixels than the output, zooming keeps real detail.
-static uint8_t* cropAndScaleRGB565(
-    const camera_fb_t* fb,
-    float zoom,
-    camera_fb_t* outFb) {
-  if (fb == nullptr || fb->format != PIXFORMAT_RGB565) {
-    return nullptr;
-  }
-
-  if (zoom < 1.0f) {
-    zoom = 1.0f;
-  }
-
-  uint32_t cropW = (uint32_t)(fb->width / zoom);
-  uint32_t cropH = (uint32_t)(fb->height / zoom);
-
-  if (cropW < 8 || cropH < 8) {
-    return nullptr;
-  }
-
-  uint32_t startX = (fb->width - cropW) / 2;
-  uint32_t startY = (fb->height - cropH) / 2;
-
-  // RGB565 uses 2 bytes per pixel
-  size_t outLen = (size_t)OUTPUT_W * OUTPUT_H * 2;
-
-  uint16_t* dst = (uint16_t*)ps_malloc(outLen);
-
-  if (dst == nullptr) {
-    return nullptr;
-  }
-
-  const uint16_t* src = (const uint16_t*)fb->buf;
-
-  // Source column for every output column (computed once per frame)
-  uint16_t colMap[OUTPUT_W];
-
-  for (uint16_t x = 0; x < OUTPUT_W; x++) {
-    colMap[x] = (uint16_t)(startX + (uint32_t)x * cropW / OUTPUT_W);
-  }
-
-  for (uint16_t y = 0; y < OUTPUT_H; y++) {
-    uint32_t sy = startY + (uint32_t)y * cropH / OUTPUT_H;
-
-    const uint16_t* srcRow = src + (size_t)sy * fb->width;
-    uint16_t* dstRow = dst + (size_t)y * OUTPUT_W;
-
-    for (uint16_t x = 0; x < OUTPUT_W; x++) {
-      dstRow[x] = srcRow[colMap[x]];
-    }
-  }
-
-  // Frame descriptor for the resampled image
-  *outFb = *fb;
-
-  outFb->buf = (uint8_t*)dst;
-  outFb->len = outLen;
-  outFb->width = OUTPUT_W;
-  outFb->height = OUTPUT_H;
-
-  return (uint8_t*)dst;
-}
 
 // ================= WEB SERVER =================
 
@@ -461,8 +395,12 @@ static esp_err_t streamHandler(httpd_req_t* req) {
     // Resample whenever the capture size differs from the output size or
     // the user zoomed in
     if (currentZoom > 1.01f ||
-        fb->width != OUTPUT_W || fb->height != OUTPUT_H) {
-      croppedBuf = cropAndScaleRGB565(fb, currentZoom, &croppedFb);
+        fb->width != ImageProcessor::OUTPUT_WIDTH ||
+        fb->height != ImageProcessor::OUTPUT_HEIGHT) {
+      croppedBuf = ImageProcessor::cropAndScaleRGB565(
+          fb,
+          currentZoom,
+          &croppedFb);
 
       if (croppedBuf != nullptr) {
         frameToEncode = &croppedFb;
