@@ -6,8 +6,7 @@
 #include "camera/image_processor.h"
 #include "esp_camera.h"
 #include "esp_http_server.h"
-#include "secrets.h"
-
+#include "network/wifi_manager.h"
 // ================= TUNING =================
 
 // frame2jpg() quality: 0-100, HIGHER = better image (10 gave blocky output)
@@ -30,7 +29,6 @@ static const int JPEG_QUALITY = 50;
 
 // Wi-Fi transmit power. 15 dBm gave the best results in testing
 // (8.5 dBm was too weak, default 19.5 dBm was worse).
-static const wifi_power_t WIFI_TX_POWER = WIFI_POWER_15dBm;
 
 // Frames discarded after init so auto exposure / white balance can settle
 
@@ -576,36 +574,7 @@ void setup() {
     return;
   }
 
-  // Connect WiFi
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_TX_POWER);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  Serial.print("Connecting to WiFi");
-
-  unsigned long startTime = millis();
-
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - startTime < 20000) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println();
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi connection failed!");
-    return;
-  }
-
-  Serial.println("WiFi connected!");
-  WiFi.setSleep(false);
-  Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  // Start web server
+    // Start web server
   startCameraServer();
 
   Serial.println("Open the IP address in your browser.");
