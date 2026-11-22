@@ -1,32 +1,13 @@
-
 #include <Arduino.h>
-#include <HTTPClient.h>
 #include <WiFi.h>
-#include <WiFiClient.h>
-#include <esp_camera.h>
+#include <lwip/sockets.h>
 
+#include "esp_camera.h"
+#include "esp_http_server.h"
 #include "secrets.h"
-#include "wifi_manager.h"
+// ================= WIFI CONFIGURATION =================
 
-// ==========================================
-// TUNING
-// ==========================================
-
-static const uint32_t CAPTURE_INTERVAL_MS = 5000;
-
-// HTTP timeouts
-static const int32_t HTTP_CONNECT_TIMEOUT_MS = 8000;
-static const uint16_t HTTP_READ_TIMEOUT_MS = 15000;
-
-// Retry policy
-static const int UPLOAD_MAX_ATTEMPTS = 3;               // per captured frame
-static const uint32_t UPLOAD_RETRY_BASE_DELAY_MS = 1500;  // grows per attempt
-static const int FAILS_BEFORE_WIFI_RESET = 3;           // failed frames in a row
-static const int FAILS_BEFORE_REBOOT = 10;              // failed frames in a row
-
-// ==========================================
-// CAMERA PIN CONFIGURATION - AI THINKER
-// ==========================================
+// ================= AI THINKER ESP32-CAM PINS =================
 
 #define PWDN_GPIO_NUM 32
 #define RESET_GPIO_NUM -1
@@ -47,15 +28,102 @@ static const int FAILS_BEFORE_REBOOT = 10;              // failed frames in a ro
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 
-// ==========================================
-// CAMERA INITIALIZATION
-// ==========================================
+// ================= TUNING =================
 
-// true  = sensor outputs JPEG natively (OV2640 etc.)
-// false = sensor only supports RGB565, frames are converted with frame2jpg()
-static bool useNativeJpeg = true;
+// frame2jpg() quality: 0-100, HIGHER = better image (10 gave blocky output)
+static const int JPEG_QUALITY = 50;
 
-bool initCamera(bool nativeJpeg) {
+// Size the SENSOR captures. QVGA is the fastest (VGA RGB565 only gave ~2 fps).
+static const framesize_t CAPTURE_FRAME_SIZE = FRAMESIZE_QVGA;
+
+// Field of view of the GC2145 when it captures QVGA (320x240).
+// The driver reads only a small centre window of the 1600x1200 pixel array
+// (looks "zoomed in"). Here the sensor reads a (320*N) x (240*N) window and
+// subsamples it by 1/N, so the output stays 320x240:
+//   N = 5 -> whole 1600x1200 array (widest view)
+//   N = 4 -> 1280x960 window
+//   N = 3 -> 960x720 window
+//   N = 0 -> keep the driver default
+// A wider view may lower the sensor frame rate: try 5, then 4, then 3.
+static const int SENSOR_VIEW_DEN = 3;
+
+// Size that is JPEG-encoded and sent to the browser (fixed => the encoding
+// time stays the same no matter what the capture size or zoom is).
+static const uint16_t OUTPUT_W = 320;
+static const uint16_t OUTPUT_H = 240;
+
+// Wi-Fi transmit power. 15 dBm gave the best results in testing
+// (8.5 dBm was too weak, default 19.5 dBm was worse).
+static const wifi_power_t WIFI_TX_POWER = WIFI_POWER_15dBm;
+
+// Frames discarded after init so auto exposure / white balance can settle
+static const int WARMUP_FRAMES = 3;
+
+// ================= CAMERA INITIALIZATION =================
+
+// Widen the GC2145 field of view at QVGA by programming its window and
+// subsample registers directly (same registers the esp32-camera driver uses
+// in SUBSAMPLE mode, but with a smaller ratio = bigger window).
+static void setSensorView(int den) {
+  sensor_t* s = esp_camera_sensor_get();
+
+  // 0x2145 = GC2145 product ID
+  if (s == nullptr || s->id.PID != 0x2145 || s->set_reg == nullptr) {
+    Serial.println("Sensor view: not a GC2145, skipped");
+    return;
+  }
+
+  if (den < 3 || den > 5) {
+    return;
+  }
+
+  const uint16_t outW = 320;
+  const uint16_t outH = 240;
+  const uint16_t winW = outW * den;  // 960 / 1280 / 1600
+  const uint16_t winH = outH * den;  // 720 /  960 / 1200
+  const uint16_t rowS = (1200 - winH) / 2;
+  const uint16_t colS = (1600 - winW) / 2;
+
+  struct Reg {
+    int reg;
+    int value;
+  };
+
+  const Reg regs[] = {
+      {0xfe, 0x00},  // register page 0
+      {0x90, 0x01},  // crop enable
+      {0x09, rowS >> 8},
+      {0x0a, rowS & 0xff},
+      {0x0b, colS >> 8},
+      {0x0c, colS & 0xff},
+      {0x0d, (winH + 8) >> 8},
+      {0x0e, (winH + 8) & 0xff},
+      {0x0f, (winW + 16) >> 8},
+      {0x10, (winW + 16) & 0xff},
+      {0x99, (den << 4) | den},  // subsample ratio 1/den (0x33 / 0x44 / 0x55)
+      {0x9b, 0x00},
+      {0x9c, 0x00},
+      {0x9d, 0x00},
+      {0x9e, 0x00},
+      {0x9f, 0x00},
+      {0xa0, 0x00},
+      {0xa1, 0x00},
+      {0xa2, 0x00},
+      {0x95, outH >> 8},
+      {0x96, outH & 0xff},
+      {0x97, outW >> 8},
+      {0x98, outW & 0xff},
+  };
+
+  for (const Reg& r : regs) {
+    s->set_reg(s, r.reg, 0xff, r.value);
+  }
+
+  Serial.printf("Sensor view: window %ux%u, subsample 1/%d -> %ux%u\n",
+                winW, winH, den, outW, outH);
+}
+
+bool initCamera() {
   camera_config_t config = {};
 
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -77,31 +145,21 @@ bool initCamera(bool nativeJpeg) {
 
   config.pin_sccb_sda = SIOD_GPIO_NUM;
   config.pin_sccb_scl = SIOC_GPIO_NUM;
+
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
 
   config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_RGB565;
 
-  // Prefer the sensor's hardware JPEG encoder: a native JPEG frame is only a
-  // few KB, while RGB565 at QVGA is ~150 KB and must be converted on the CPU
-  // (slow, fragments the heap). If the sensor cannot output JPEG, initCamera()
-  // is called again with nativeJpeg=false and uses the RGB565 path.
-  config.jpeg_quality = 12;  // 0-63, lower = better quality / bigger file
-
-  if (nativeJpeg) {
-    config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size = FRAMESIZE_QVGA;
-  } else {
-    // Fallback for sensors without JPEG output ("JPEG format is not
-    // supported on this sensor", error 0x106)
-    config.pixel_format = PIXFORMAT_RGB565;
-    config.frame_size = psramFound() ? FRAMESIZE_QVGA : FRAMESIZE_QQVGA;
-  }
+  // VGA RGB565 needs ~600 KB per buffer, so it only fits in PSRAM
+  config.frame_size = psramFound() ? CAPTURE_FRAME_SIZE : FRAMESIZE_QVGA;
+  config.jpeg_quality = 12;  // not used in RGB565 mode (see JPEG_QUALITY)
 
   if (psramFound()) {
     config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.fb_count = nativeJpeg ? 2 : 1;
-    config.grab_mode = nativeJpeg ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
     config.fb_location = CAMERA_FB_IN_DRAM;
     config.fb_count = 1;
@@ -111,252 +169,664 @@ bool initCamera(bool nativeJpeg) {
   esp_err_t err = esp_camera_init(&config);
 
   if (err != ESP_OK) {
-    Serial.printf("Camera init (%s) failed! Error: 0x%x\n",
-                  nativeJpeg ? "JPEG" : "RGB565", err);
+    Serial.printf("Camera initialization failed: 0x%x\n", err);
     return false;
   }
 
-  sensor_t* s = esp_camera_sensor_get();
-  if (s) {
-    Serial.printf("Camera sensor PID: 0x%x, mode: %s\n",
-                  s->id.PID, nativeJpeg ? "native JPEG" : "RGB565->JPEG");
+  if (SENSOR_VIEW_DEN != 0 && config.frame_size == FRAMESIZE_QVGA) {
+    setSensorView(SENSOR_VIEW_DEN);
   }
 
-  useNativeJpeg = nativeJpeg;
-  return true;
-}
-
-// ==========================================
-// IMAGE UPLOAD
-// ==========================================
-
-enum class UploadResult {
-  Success,
-  NetworkError,    // could not reach the server / timeout -> worth retrying
-  ServerRejected,  // server answered with a non-200 status -> do not retry
-};
-
-// One HTTP POST attempt
-static UploadResult uploadOnce(uint8_t* imageData, size_t imageLength) {
-  WiFiClient client;  // must outlive http
-  HTTPClient http;
-
-  if (!http.begin(client, SERVER_URL)) {
-    Serial.println("http.begin() failed - check SERVER_URL in secrets.h");
-    return UploadResult::NetworkError;
-  }
-
-  http.setReuse(false);  // sends "Connection: close", no stale keep-alive socket
-  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
-  http.setTimeout(HTTP_READ_TIMEOUT_MS);
-  http.addHeader("Content-Type", "image/jpeg");
-
-  int httpCode = http.POST(imageData, imageLength);
-
-  UploadResult result;
-
-  if (httpCode == HTTP_CODE_OK) {
-    Serial.printf("Image uploaded successfully! Server says: %s\n",
-                  http.getString().c_str());
-    result = UploadResult::Success;
-  } else if (httpCode > 0) {
-    Serial.printf("Server returned HTTP %d\n", httpCode);
-    result = UploadResult::ServerRejected;
-  } else {
-    // -1 = connection failed (refused, unreachable OR connect timeout)
-    // -11 = read timeout (server accepted the data but never answered)
-    Serial.printf("HTTP request failed: %d (%s)\n",
-                  httpCode,
-                  http.errorToString(httpCode).c_str());
-    result = UploadResult::NetworkError;
-  }
-
-  http.end();
-  return result;
-}
-
-// Upload with retries and diagnostics
-static UploadResult uploadImage(uint8_t* imageData, size_t imageLength) {
-  for (int attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
-    if (!isWiFiConnected()) {
-      Serial.println("Wi-Fi disconnected. Waiting before retry...");
-      maintainWiFi();
-      delay(UPLOAD_RETRY_BASE_DELAY_MS * attempt);
-      continue;
+  // Discard the first frames: exposure and white balance are not stable yet
+  for (int i = 0; i < WARMUP_FRAMES; i++) {
+    camera_fb_t* warm = esp_camera_fb_get();
+    if (warm) {
+      esp_camera_fb_return(warm);
     }
-
-    Serial.printf("Upload attempt %d/%d -> %s\n",
-                  attempt, UPLOAD_MAX_ATTEMPTS, SERVER_URL);
-    Serial.printf("  IP: %s | RSSI: %d dBm | free heap: %u bytes\n",
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.RSSI(),
-                  (unsigned int)ESP.getFreeHeap());
-
-    UploadResult result = uploadOnce(imageData, imageLength);
-
-    if (result != UploadResult::NetworkError) {
-      return result;
-    }
-
-    if (attempt < UPLOAD_MAX_ATTEMPTS) {
-      delay(UPLOAD_RETRY_BASE_DELAY_MS * attempt);
-    }
-  }
-
-  return UploadResult::NetworkError;
-}
-
-// A JPEG always starts with the SOI marker FF D8
-static bool isValidJpeg(const camera_fb_t* fb) {
-  return fb->format == PIXFORMAT_JPEG && fb->len > 100 &&
-         fb->buf[0] == 0xFF && fb->buf[1] == 0xD8;
-}
-
-// ==========================================
-// SETUP
-// ==========================================
-
-bool cameraReady = false;
-int consecutiveFailures = 0;
-
-void setup() {
-  Serial.begin(115200);
-  delay(2000);
-
-  Serial.println();
-  Serial.println("===== ESP32-CAM INITIALIZATION =====");
-
-  Serial.printf("PSRAM: %s\n",
-                psramFound() ? "Available" : "Not found");
-
-  // Initialize Wi-Fi
-  if (!initWiFi()) {
-    Serial.println("Wi-Fi initialization failed! Will keep retrying in loop().");
-  }
-
-  Serial.print("ESP32-CAM IP: ");
-  Serial.println(WiFi.localIP());
-
-  Serial.print("Server URL: ");
-  Serial.println(SERVER_URL);
-
-  // Initialize camera (a cold start on a weak supply sometimes needs a retry)
-  // Try native JPEG first, then fall back to RGB565 if the sensor can't do it
-  for (int attempt = 1; attempt <= 3 && !cameraReady; attempt++) {
-    cameraReady = initCamera(true);
-
-    if (!cameraReady) {
-      esp_camera_deinit();
-      Serial.println("Native JPEG not available, trying RGB565...");
-      cameraReady = initCamera(false);
-    }
-
-    if (!cameraReady) {
-      Serial.printf("Camera init attempt %d/3 failed\n", attempt);
-      esp_camera_deinit();
-      delay(1000);
-    }
-  }
-
-  if (!cameraReady) {
-    Serial.println("Camera initialization FAILED! Restarting in 5 s...");
-    delay(5000);
-    ESP.restart();
+    delay(50);
   }
 
   Serial.println("Camera initialized successfully!");
+  return true;
 }
 
-// ==========================================
-// MAIN LOOP
-// ==========================================
+// ================= CAMERA CONTROL =================
 
-void loop() {
-  maintainWiFi();
+static float requestedZoom = 1.0f;
 
-  if (!isWiFiConnected()) {
-    delay(1000);
-    return;
+// Protect shared zoom value between HTTP server tasks
+static portMUX_TYPE zoomMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Take the centre region (frame size / zoom) of an RGB565 frame and resample
+// it (nearest neighbour) to OUTPUT_W x OUTPUT_H.
+// At zoom 1.0 this is the whole sensor image (full field of view); when the
+// sensor captures more pixels than the output, zooming keeps real detail.
+static uint8_t* cropAndScaleRGB565(
+    const camera_fb_t* fb,
+    float zoom,
+    camera_fb_t* outFb) {
+  if (fb == nullptr || fb->format != PIXFORMAT_RGB565) {
+    return nullptr;
   }
 
-  Serial.println();
-  Serial.println("===== CAPTURING IMAGE =====");
-
-  // Capture a JPEG frame straight from the sensor
-  camera_fb_t* fb = esp_camera_fb_get();
-
-  if (!fb) {
-    Serial.println("Failed to capture image!");
-    delay(3000);
-    return;
+  if (zoom < 1.0f) {
+    zoom = 1.0f;
   }
 
-  uint8_t* jpgBuf = nullptr;  // only used in RGB565 fallback mode
-  size_t jpgLen = 0;
-  uint8_t* sendBuf = nullptr;
-  size_t sendLen = 0;
+  uint32_t cropW = (uint32_t)(fb->width / zoom);
+  uint32_t cropH = (uint32_t)(fb->height / zoom);
 
-  if (useNativeJpeg) {
-    if (!isValidJpeg(fb)) {
-      Serial.printf("Invalid frame (format=%d, len=%u), skipping.\n",
-                    (int)fb->format, (unsigned int)fb->len);
-      esp_camera_fb_return(fb);
-      delay(1000);
-      return;
+  if (cropW < 8 || cropH < 8) {
+    return nullptr;
+  }
+
+  uint32_t startX = (fb->width - cropW) / 2;
+  uint32_t startY = (fb->height - cropH) / 2;
+
+  // RGB565 uses 2 bytes per pixel
+  size_t outLen = (size_t)OUTPUT_W * OUTPUT_H * 2;
+
+  uint16_t* dst = (uint16_t*)ps_malloc(outLen);
+
+  if (dst == nullptr) {
+    return nullptr;
+  }
+
+  const uint16_t* src = (const uint16_t*)fb->buf;
+
+  // Source column for every output column (computed once per frame)
+  uint16_t colMap[OUTPUT_W];
+
+  for (uint16_t x = 0; x < OUTPUT_W; x++) {
+    colMap[x] = (uint16_t)(startX + (uint32_t)x * cropW / OUTPUT_W);
+  }
+
+  for (uint16_t y = 0; y < OUTPUT_H; y++) {
+    uint32_t sy = startY + (uint32_t)y * cropH / OUTPUT_H;
+
+    const uint16_t* srcRow = src + (size_t)sy * fb->width;
+    uint16_t* dstRow = dst + (size_t)y * OUTPUT_W;
+
+    for (uint16_t x = 0; x < OUTPUT_W; x++) {
+      dstRow[x] = srcRow[colMap[x]];
+    }
+  }
+
+  // Frame descriptor for the resampled image
+  *outFb = *fb;
+
+  outFb->buf = (uint8_t*)dst;
+  outFb->len = outLen;
+  outFb->width = OUTPUT_W;
+  outFb->height = OUTPUT_H;
+
+  return (uint8_t*)dst;
+}
+
+// ================= WEB SERVER =================
+
+const char INDEX_HTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <title>ESP32-CAM Control Panel</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
     }
 
-    Serial.printf("JPEG: %u bytes, %u x %u\n",
-                  (unsigned int)fb->len, fb->width, fb->height);
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: Arial, sans-serif;
+      background: #111827;
+      color: #f9fafb;
+    }
 
-    // Upload the frame buffer directly - no extra copy or conversion
-    sendBuf = fb->buf;
-    sendLen = fb->len;
-  } else {
-    Serial.printf("RGB565: %u bytes, %u x %u\n",
-                  (unsigned int)fb->len, fb->width, fb->height);
+    .container {
+      max-width: 1100px;
+      margin: auto;
+    }
 
-    bool converted = frame2jpg(fb, 12, &jpgBuf, &jpgLen);
-    // Release the camera buffer right after conversion, before the upload
+    header {
+      margin-bottom: 24px;
+    }
+
+    header h1 {
+      margin-bottom: 8px;
+    }
+
+    .status {
+      color: #4ade80;
+      font-size: 14px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 20px;
+    }
+
+    .card {
+      background: #1f2937;
+      border-radius: 12px;
+      padding: 20px;
+    }
+
+    .preview {
+      width: 100%;
+      min-height: 240px;
+      background: #000;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    .preview img {
+      display: block;
+      width: 100%;
+      height: auto;
+      max-height: 65vh;
+      object-fit: contain;
+    }
+
+    .setting {
+      margin: 20px 0;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #374151;
+    }
+
+    .setting label {
+      display: block;
+      margin-bottom: 8px;
+      font-weight: bold;
+    }
+
+    input, select {
+      width: 100%;
+    }
+
+    input:disabled,
+    select:disabled {
+      opacity: 0.5;
+    }
+
+    .note {
+      color: #9ca3af;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 750px) {
+      body {
+        padding: 14px;
+      }
+
+      .layout {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+  
+</head>
+
+<body>
+  <div class="container">
+
+    <header>
+      <h1>ESP32-CAM Control Panel</h1>
+      <div class="status">
+        ● Camera streaming
+      </div>
+    </header>
+
+    <div class="layout">
+
+      <section class="card">
+
+<div class="setting">
+  <label for="zoomRange">
+    Digital Zoom:
+    <span id="zoomValue">1.0×</span>
+  </label>
+
+  <input
+  type="range"
+  id="zoomRange"
+  min="1.0"
+  max="4.0"
+  step="0.1"
+  value="1.0"
+  oninput="
+    document.getElementById('zoomValue').textContent =
+    Number(this.value).toFixed(1) + '×';
+  "
+  onchange="sendZoom(this.value)"
+>
+
+  <p class="note">
+    Adjust digital zoom from 1.0× to 4.0×.
+  </p>
+</div>
+
+        <h2>Live Preview</h2>
+
+        <div class="preview">
+          <img id="cameraStream"
+  alt="Camera Stream"
+  style="width: 100%; height: auto;">
+        </div>
+
+        <p class="note">
+          Live MJPEG stream from ESP32-CAM.
+        </p>
+      </section>
+
+      <section class="card">
+        <h2>Camera Settings</h2>
+
+        <div class="setting">
+          <label>JPEG Quality</label>
+          <input type="range" min="10" max="90"
+                 value="80" disabled>
+          <p class="note">
+            Available in the next development step.
+          </p>
+        </div>
+
+        <div class="setting">
+          <label>Brightness</label>
+          <input type="range" min="-2" max="2"
+                 value="0" disabled>
+        </div>
+
+        <div class="setting">
+          <label>Contrast</label>
+          <input type="range" min="-2" max="2"
+                 value="0" disabled>
+        </div>
+
+        <div class="setting">
+          <label>Resolution</label>
+          <select disabled>
+            <option>QVGA (320x240)</option>
+          </select>
+        </div>
+
+        <p class="note">
+          Camera controls will be enabled
+          after the control API is implemented.
+        </p>
+      </section>
+
+    </div>
+  </div>
+  <script>
+  // Initialize camera stream
+  const streamUrl =
+    'http://' + window.location.hostname + ':81/stream';
+
+  document.getElementById('cameraStream').src = streamUrl;
+
+
+  // Send zoom command to ESP32
+  async function sendZoom(value) {
+    try {
+      const response = await fetch(
+        `/control?zoom=${encodeURIComponent(value)}`
+      );
+
+      const message = await response.text();
+
+      if (!response.ok) {
+        throw new Error(message);
+      }
+
+      console.log(message);
+
+    } catch (error) {
+      console.error('Zoom control failed:', error);
+    }
+  }
+</script>
+</body>
+</html>
+)rawliteral";
+
+static esp_err_t indexHandler(httpd_req_t* req) {
+  httpd_resp_set_type(req, "text/html");
+
+  return httpd_resp_send(
+      req,
+      INDEX_HTML,
+      HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t controlHandler(httpd_req_t* req) {
+  char query[64];
+  char value[16];
+
+  // Get URL query string
+  if (httpd_req_get_url_query_str(
+          req, query, sizeof(query)) != ESP_OK) {
+    httpd_resp_send_err(
+        req, HTTPD_400_BAD_REQUEST, "Missing query");
+    return ESP_FAIL;
+  }
+
+  // Extract zoom parameter
+  if (httpd_query_key_value(
+          query, "zoom", value, sizeof(value)) != ESP_OK) {
+    httpd_resp_send_err(
+        req, HTTPD_400_BAD_REQUEST, "Missing zoom parameter");
+    return ESP_FAIL;
+  }
+
+  // Convert string to float
+  char* endPtr = nullptr;
+  float zoom = strtof(value, &endPtr);
+
+  // Validate input
+  if (endPtr == value || *endPtr != '\0' ||
+      zoom < 1.0f || zoom > 4.0f) {
+    httpd_resp_send_err(
+        req, HTTPD_400_BAD_REQUEST, "Invalid zoom value");
+    return ESP_FAIL;
+  }
+
+  // Store requested zoom safely
+  portENTER_CRITICAL(&zoomMux);
+  requestedZoom = zoom;
+  portEXIT_CRITICAL(&zoomMux);
+
+  Serial.printf(
+      "Requested Zoom: %.1fx\n", zoom);
+
+  // Send response
+  char response[64];
+  snprintf(
+      response,
+      sizeof(response),
+      "Zoom updated: %.1fx",
+      requestedZoom);
+
+  httpd_resp_set_type(req, "text/plain");
+
+  return httpd_resp_send(
+      req, response, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t streamHandler(httpd_req_t* req) {
+  esp_err_t res = ESP_OK;
+
+  httpd_resp_set_type(
+      req,
+      "multipart/x-mixed-replace;boundary=frame");
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+
+  int sock = httpd_req_to_sockfd(req);
+  int one = 1;
+  setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+  // Timing statistics (printed every 30 frames)
+  uint32_t tCap = 0, tEnc = 0, tSend = 0, totalBytes = 0, frames = 0;
+  uint32_t windowStart = micros();
+
+  while (true) {
+    uint32_t t0 = micros();
+
+    // 1. Capture RGB565 frame
+    camera_fb_t* fb = esp_camera_fb_get();
+
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      res = ESP_FAIL;
+      break;
+    }
+
+    uint32_t t1 = micros();
+
+    uint8_t* jpgBuf = nullptr;
+    size_t jpgLen = 0;
+
+    // 2. Read current zoom value safely
+    float currentZoom;
+
+    portENTER_CRITICAL(&zoomMux);
+    currentZoom = requestedZoom;
+    portEXIT_CRITICAL(&zoomMux);
+
+    // 3. Select frame for JPEG encoding
+    camera_fb_t croppedFb;
+    camera_fb_t* frameToEncode = fb;
+    uint8_t* croppedBuf = nullptr;
+
+    // Resample whenever the capture size differs from the output size or
+    // the user zoomed in
+    if (currentZoom > 1.01f ||
+        fb->width != OUTPUT_W || fb->height != OUTPUT_H) {
+      croppedBuf = cropAndScaleRGB565(fb, currentZoom, &croppedFb);
+
+      if (croppedBuf != nullptr) {
+        frameToEncode = &croppedFb;
+      } else {
+        Serial.println("Resize failed. Using original frame.");
+      }
+    }
+
+    // 4. Convert selected frame to JPEG
+    bool converted = frame2jpg(
+        frameToEncode,
+        JPEG_QUALITY,
+        &jpgBuf,
+        &jpgLen);
+
+    // Release temporary crop buffer
+    if (croppedBuf != nullptr) {
+      free(croppedBuf);
+      croppedBuf = nullptr;
+    }
+
+    // Return original camera frame buffer
     esp_camera_fb_return(fb);
     fb = nullptr;
 
-    if (!converted || jpgBuf == nullptr) {
-      Serial.println("JPEG conversion FAILED!");
-      delay(5000);
-      return;
+    if (!converted || jpgBuf == nullptr || jpgLen == 0) {
+      Serial.println("RGB565 to JPEG conversion failed");
+
+      if (jpgBuf != nullptr) {
+        free(jpgBuf);
+      }
+
+      res = ESP_FAIL;
+      break;
     }
 
-    Serial.printf("JPEG size: %u bytes\n", (unsigned int)jpgLen);
-    sendBuf = jpgBuf;
-    sendLen = jpgLen;
-  }
+    uint32_t t2 = micros();
 
-  UploadResult result = uploadImage(sendBuf, sendLen);
+    // 5. Send boundary + header + JPEG as ONE chunk
+    uint32_t thisJpgLen = (uint32_t)jpgLen;
 
-  if (fb) {
-    esp_camera_fb_return(fb);
-  }
-  if (jpgBuf) {
+    char head[128];
+    int headLen = snprintf(
+        head, sizeof(head),
+        "\r\n--frame\r\n"
+        "Content-Type: image/jpeg\r\n"
+        "Content-Length: %u\r\n\r\n",
+        (unsigned int)jpgLen);
+
+    size_t packetLen = (size_t)headLen + jpgLen;
+    uint8_t* packet = (uint8_t*)malloc(packetLen);
+
+    if (packet == nullptr) {
+      free(jpgBuf);
+      res = ESP_FAIL;
+      break;
+    }
+
+    memcpy(packet, head, headLen);
+    memcpy(packet + headLen, jpgBuf, jpgLen);
+
     free(jpgBuf);
     jpgBuf = nullptr;
-  }
 
-  if (result == UploadResult::Success) {
-    consecutiveFailures = 0;
-  } else if (result == UploadResult::NetworkError) {
-    consecutiveFailures++;
-    Serial.printf("Upload failed (%d in a row)\n", consecutiveFailures);
+    res = httpd_resp_send_chunk(req, (const char*)packet, packetLen);
+    free(packet);
 
-    if (consecutiveFailures >= FAILS_BEFORE_REBOOT) {
-      Serial.println("Too many failures - rebooting.");
-      delay(500);
-      ESP.restart();
-    } else if (consecutiveFailures % FAILS_BEFORE_WIFI_RESET == 0) {
-      forceReconnectWiFi();
+    if (res != ESP_OK) {
+      Serial.println("Stream client disconnected");
+      break;
+    }
+
+    // 9. Statistics
+    uint32_t t3 = micros();
+
+    tCap += t1 - t0;
+    tEnc += t2 - t1;
+    tSend += t3 - t2;
+    totalBytes += thisJpgLen;
+
+    if (++frames >= 30) {
+      float fps = 30000000.0f / (float)(micros() - windowStart);
+
+      Serial.printf(
+          "30 frames | %.1f fps | chup %u ms | ma hoa %u ms | gui %u ms | %u KB/khung | heap %u (min %u) | RSSI %d\n",
+          fps,
+          (unsigned int)(tCap / 30000),
+          (unsigned int)(tEnc / 30000),
+          (unsigned int)(tSend / 30000),
+          (unsigned int)(totalBytes / 30 / 1024),
+          (unsigned int)ESP.getFreeHeap(),
+          (unsigned int)ESP.getMinFreeHeap(),
+          (int)WiFi.RSSI());
+
+      tCap = tEnc = tSend = totalBytes = frames = 0;
+      windowStart = micros();
     }
   }
 
-  Serial.println("Image processing completed.");
+  return res;
+}
 
-  delay(CAPTURE_INTERVAL_MS);
+void startCameraServer() {
+  // Server 1: Control Panel on port 80
+  httpd_config_t controlConfig = HTTPD_DEFAULT_CONFIG();
+
+  controlConfig.server_port = 80;
+  controlConfig.ctrl_port = 32768;
+  controlConfig.max_uri_handlers = 4;
+  controlConfig.lru_purge_enable = true;  // free stale sockets automatically
+
+  httpd_handle_t controlServer = nullptr;
+
+  if (httpd_start(&controlServer, &controlConfig) == ESP_OK) {
+    httpd_uri_t indexUri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = indexHandler,
+        .user_ctx = nullptr};
+
+    httpd_register_uri_handler(controlServer, &indexUri);
+    httpd_uri_t controlUri = {
+        .uri = "/control",
+        .method = HTTP_GET,
+        .handler = controlHandler,
+        .user_ctx = nullptr};
+
+    httpd_register_uri_handler(controlServer, &controlUri);
+
+    Serial.println("Control Panel server started on port 80!");
+  } else {
+    Serial.println("Failed to start Control Panel server!");
+    return;
+  }
+
+  // Server 2: Video stream on port 81
+  httpd_config_t streamConfig = HTTPD_DEFAULT_CONFIG();
+
+  streamConfig.server_port = 81;
+  streamConfig.ctrl_port = 32769;
+  streamConfig.max_uri_handlers = 4;
+  streamConfig.lru_purge_enable = true;  // free stale sockets automatically
+
+  httpd_handle_t streamServer = nullptr;
+
+  if (httpd_start(&streamServer, &streamConfig) == ESP_OK) {
+    httpd_uri_t streamUri = {
+        .uri = "/stream",
+        .method = HTTP_GET,
+        .handler = streamHandler,
+        .user_ctx = nullptr};
+
+    httpd_register_uri_handler(streamServer, &streamUri);
+
+    Serial.println("Camera stream server started on port 81!");
+  } else {
+    Serial.println("Failed to start camera stream server!");
+  }
+}
+
+// ================= SETUP =================
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nESP32-CAM Stream Test");
+
+  // Check PSRAM
+  Serial.printf("PSRAM found: %s\n", psramFound() ? "YES" : "NO");
+
+  // Initialize camera
+  if (!initCamera()) {
+    Serial.println("Camera setup failed. Restart required.");
+    return;
+  }
+
+  // Connect WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_TX_POWER);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to WiFi");
+
+  unsigned long startTime = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startTime < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connection failed!");
+    return;
+  }
+
+  Serial.println("WiFi connected!");
+  WiFi.setSleep(false);
+  Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Start web server
+  startCameraServer();
+
+  Serial.println("Open the IP address in your browser.");
+}
+
+// ================= LOOP =================
+
+void loop() {
+  // Camera capture is handled by streamHandler().
+  delay(1000);
 }
