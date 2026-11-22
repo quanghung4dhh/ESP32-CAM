@@ -3,18 +3,8 @@
 #include <Arduino.h>
 
 #include "../config/camera_pins.h"
+#include "app_config.h"
 #include "esp_camera.h"
-
-// ================= CAMERA CONFIGURATION =================
-
-// Size the SENSOR captures.
-static const framesize_t CAPTURE_FRAME_SIZE = FRAMESIZE_QVGA;
-
-// Field of view configuration for GC2145.
-static const int SENSOR_VIEW_DEN = 3;
-
-// Frames discarded after init so auto exposure / white balance can settle.
-static const int WARMUP_FRAMES = 3;
 
 // ================= SENSOR CONFIGURATION =================
 
@@ -33,8 +23,8 @@ static void setSensorView(int den) {
     return;
   }
 
-  const uint16_t outW = 320;
-  const uint16_t outH = 240;
+  const uint16_t outW = OUTPUT_WIDTH;
+  const uint16_t outH = OUTPUT_HEIGHT;
   const uint16_t winW = outW * den;
   const uint16_t winH = outH * den;
   const uint16_t rowS = (1200 - winH) / 2;

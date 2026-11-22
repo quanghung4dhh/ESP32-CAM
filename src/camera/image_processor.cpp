@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 
+#include "app_config.h"
+
 // ================= IMAGE PROCESSING =================
 
 uint8_t* ImageProcessor::cropAndScaleRGB565(

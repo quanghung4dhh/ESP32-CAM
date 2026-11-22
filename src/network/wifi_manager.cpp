@@ -1,10 +1,10 @@
 
 #include "wifi_manager.h"
 
+#include "app_config.h"
 #include "secrets.h"
 
 // Connection settings
-static const unsigned long WIFI_TIMEOUT = 20000;
 static const unsigned long RECONNECT_INTERVAL = 10000;
 
 // Reconnection management
@@ -19,7 +19,7 @@ bool initWiFi() {
   // Do not write credentials to flash on every WiFi.begin()
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
-  WiFi.setTxPower(WIFI_POWER_15dBm);
+  WiFi.setTxPower(WIFI_TX_POWER);
 
   // IMPORTANT: the ESP32 enables modem-sleep by default. In that mode the
   // radio sleeps between AP beacons, which causes delayed/dropped TCP packets
@@ -36,7 +36,7 @@ bool initWiFi() {
   unsigned long startTime = millis();
 
   while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - startTime >= WIFI_TIMEOUT) {
+    if (millis() - startTime >= WIFI_CONNECT_TIMEOUT_MS) {
       Serial.println("Wi-Fi connection timeout!");
       return false;
     }

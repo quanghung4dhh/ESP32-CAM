@@ -7,10 +7,10 @@
 
 namespace ImageProcessor {
 
-constexpr uint16_t OUTPUT_WIDTH = 320;
-constexpr uint16_t OUTPUT_HEIGHT = 240;
-
-// Crop the center region and resize an RGB565 frame.
+// Crop the center region of an RGB565 frame and resize it (nearest neighbour)
+// to OUTPUT_WIDTH x OUTPUT_HEIGHT (see app_config.h).
+// On success returns a new buffer that the caller must free(); returns
+// nullptr if the frame is not RGB565, the crop is too small or memory is out.
 uint8_t* cropAndScaleRGB565(
     const camera_fb_t* fb,
     float zoom,
