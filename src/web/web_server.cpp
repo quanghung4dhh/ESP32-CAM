@@ -86,6 +86,10 @@ static esp_err_t controlHandler(httpd_req_t* req) {
 // Returns ESP_ERR_NO_MEM if the packet buffer could not be allocated, or the
 // httpd_resp_send_chunk() result (!= ESP_OK when the client went away).
 static esp_err_t sendFrame(httpd_req_t* req, uint8_t* jpgBuf, size_t jpgLen) {
+  if (jpgBuf == nullptr || jpgLen == 0) {
+    free(jpgBuf);
+    return ESP_ERR_INVALID_ARG;
+  }
   char head[128];
   int headLen = snprintf(
       head, sizeof(head),
@@ -93,6 +97,15 @@ static esp_err_t sendFrame(httpd_req_t* req, uint8_t* jpgBuf, size_t jpgLen) {
       "Content-Type: image/jpeg\r\n"
       "Content-Length: %u\r\n\r\n",
       (unsigned int)jpgLen);
+  if (headLen < 0 || (size_t)headLen >= sizeof(head)) {
+    free(jpgBuf);
+    return ESP_FAIL;
+  }
+
+  if (jpgLen > SIZE_MAX - (size_t)headLen) {
+    free(jpgBuf);
+    return ESP_ERR_INVALID_SIZE;
+  }
 
   size_t packetLen = (size_t)headLen + jpgLen;
   uint8_t* packet = (uint8_t*)malloc(packetLen);
