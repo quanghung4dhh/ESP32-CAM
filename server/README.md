@@ -28,6 +28,20 @@ Mở `http://<IP-máy-chạy-server>:5000/` để xem video, chỉnh zoom và xe
 > ESP32 (cổng 80) sẽ không hiện được video (ESP32 chỉ phục vụ một người xem
 > stream). Hãy xem video ở trang của server.
 
+## Lưu ảnh
+
+Ảnh nằm trong `server/captured_images/`:
+
+- `motion_YYYYMMDD_HHMMSS.jpg`: ảnh lúc phát hiện chuyển động (có khung đánh dấu).
+- `snapshot_YYYYMMDD_HHMMSS.jpg`: ảnh bấm **📸 Chụp ngay** trên dashboard
+  (ảnh gốc, không khung, không gửi Telegram/Discord).
+
+Khi khởi động lại, server đọc lại các ảnh này nên dashboard vẫn hiện 24 ảnh
+gần nhất. Ảnh bị xóa khi vượt `MAX_EVENT_FILES` hoặc cũ hơn `MAX_EVENT_DAYS`
+(kiểm tra mỗi giờ và mỗi lần có ảnh mới). Muốn giữ ảnh vĩnh viễn thì đặt
+`MAX_EVENT_DAYS=0` và `MAX_EVENT_FILES=0`, hoặc tự sao chép ảnh đi chỗ khác.
+Chụp tay cũng có thể gọi bằng `curl -X POST http://<IP>:5000/api/snapshot`.
+
 ## Tạo bot Telegram
 
 1. Chat với `@BotFather`, gửi `/newbot`, làm theo hướng dẫn để lấy **token**.
@@ -82,7 +96,8 @@ Lệnh gửi một ảnh thử tới mọi dịch vụ đã cấu hình và in k
 | `MOTION_THRESHOLD`                       | `25`        | Độ lệch sáng (0-255) để tính là thay đổi                                             |
 | `MOTION_MIN_FRAMES`                      | `2`         | Số khung liên tiếp có chuyển động mới báo                                            |
 | `MOTION_COOLDOWN`                        | `30`        | Giây tối thiểu giữa hai thông báo                                                    |
-| `MAX_EVENT_FILES`                        | `200`       | Số ảnh sự kiện giữ lại                                                               |
+| `MAX_EVENT_FILES`                        | `200`       | Số ảnh tối đa giữ lại (ảnh chuyển động + ảnh chụp tay); ảnh cũ nhất bị xóa trước     |
+| `MAX_EVENT_DAYS`                         | `7`         | Xóa ảnh cũ hơn số ngày này (`0` = không xóa theo tuổi)                               |
 | `SAVE_UPLOADS`                           | `false`     | Lưu mọi ảnh gửi tới `/upload`                                                        |
 | `PORT`                                   | `5000`      | Cổng của server                                                                      |
 

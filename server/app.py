@@ -75,6 +75,7 @@ MOTION_THRESHOLD = env_int("MOTION_THRESHOLD", 25)
 MOTION_MIN_FRAMES = env_int("MOTION_MIN_FRAMES", 2)
 MOTION_COOLDOWN = env_float("MOTION_COOLDOWN", 30.0)  # seconds between alerts
 MAX_EVENT_FILES = env_int("MAX_EVENT_FILES", 200)
+MAX_EVENT_DAYS = env_float("MAX_EVENT_DAYS", 7.0)  # 0 = keep forever
 SAVE_UPLOADS = env_bool("SAVE_UPLOADS", False)
 PORT = env_int("PORT", 5000)
 
@@ -101,6 +102,7 @@ detector = MotionDetector(
 
 pipeline_lock = threading.Lock()
 events = deque(maxlen=24)  # newest first
+events_lock = threading.Lock()
 state = {
     "motion_now": False,
     "motion_frames": 0,
@@ -116,14 +118,83 @@ def log(message):
 # --------------------------------------------------------------- processing
 
 
-def cleanup_events():
-    files = sorted(EVENT_DIR.glob("motion_*.jpg"))
+TIME_FORMAT = "%H:%M:%S %d/%m/%Y"
+EVENT_PATTERNS = ("motion_*.jpg", "snapshot_*.jpg")  # motion alerts, manual
 
-    for old in files[:-MAX_EVENT_FILES] if MAX_EVENT_FILES > 0 else []:
+
+def _mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def event_files():
+    """Saved pictures (motion + manual), oldest first."""
+    files = []
+
+    for pattern in EVENT_PATTERNS:
+        files.extend(EVENT_DIR.glob(pattern))
+
+    return sorted(files, key=_mtime)
+
+
+def cleanup_events():
+    """Delete pictures beyond MAX_EVENT_FILES or older than MAX_EVENT_DAYS."""
+    files = event_files()
+    doomed = set()
+
+    if MAX_EVENT_FILES > 0 and len(files) > MAX_EVENT_FILES:
+        doomed.update(files[:-MAX_EVENT_FILES])
+
+    if MAX_EVENT_DAYS > 0:
+        limit = time.time() - MAX_EVENT_DAYS * 86400
+        doomed.update(p for p in files if _mtime(p) < limit)
+
+    for old in doomed:
         try:
             old.unlink()
         except OSError:
             pass
+
+
+def add_event(filename, when, area=None, kind="motion"):
+    """Remember a saved picture for the dashboard (newest first)."""
+    entry = {
+        "file": filename,
+        "time": when.strftime(TIME_FORMAT),
+        "area": area,
+        "kind": kind,  # "motion" or "manual"
+    }
+
+    with events_lock:
+        for old in [e for e in events if e["file"] == filename]:
+            events.remove(old)  # same-second duplicate
+
+        events.appendleft(entry)
+
+
+def load_events():
+    """Rebuild the dashboard list from the pictures already on disk."""
+    for path in event_files()[-events.maxlen:]:
+        kind = "manual" if path.name.startswith("snapshot_") else "motion"
+
+        try:
+            # motion_20261125_113045.jpg -> 20261125_113045
+            when = datetime.strptime(
+                path.name.split("_", 1)[1][:15], "%Y%m%d_%H%M%S"
+            )
+        except (IndexError, ValueError):
+            when = datetime.fromtimestamp(_mtime(path))
+
+        add_event(path.name, when, None, kind)
+
+
+def cleanup_loop():
+    """Age-based cleanup must also run when nothing moves in front of the camera."""
+    while True:
+        time.sleep(3600)
+        cleanup_events()
 
 
 def handle_motion(image, result):
@@ -141,13 +212,7 @@ def handle_motion(image, result):
 
     path.write_bytes(encoded.tobytes())
 
-    events.appendleft(
-        {
-            "file": filename,
-            "time": now.strftime("%H:%M:%S %d/%m/%Y"),
-            "area": result.area,
-        }
-    )
+    add_event(filename, now, result.area, "motion")
 
     log(f"[motion] {filename} (changed area {result.area}px)")
 
@@ -211,11 +276,15 @@ PAGE = """<!doctype html>
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}
   .grid img{width:100%;border-radius:6px}.grid small{color:#9ca3af}
   input[type=range]{width:100%}
+  button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-size:15px;cursor:pointer}
+  button:disabled{opacity:.5}
 </style></head><body><div class="wrap">
 <h2>ESP32-CAM Security</h2>
 <img class="live" id="live" alt="Live stream">
 <div class="card">
   <div id="status">Đang tải trạng thái...</div>
+  <p><button id="snap" onclick="snap()">📸 Chụp ngay</button>
+     <span id="snapmsg"></span></p>
   {% if zoom_enabled %}
   <p>Zoom: <b id="zv">1.0×</b></p>
   <input type="range" id="zoom" min="1" max="4" step="0.1" value="1"
@@ -227,6 +296,17 @@ PAGE = """<!doctype html>
   <div class="grid" id="events"></div></div>
 <script>
 const live=document.getElementById('live');
+async function snap(){
+  const b=document.getElementById('snap'),m=document.getElementById('snapmsg');
+  b.disabled=true;
+  try{
+    const r=await fetch('/api/snapshot',{method:'POST'});
+    const j=await r.json();
+    m.textContent=r.ok?'Đã lưu '+j.file:(j.error||'Lỗi');
+  }catch(e){m.textContent='Lỗi kết nối';}
+  b.disabled=false;
+  refresh();
+}
 function startStream(){live.src='/stream?'+Date.now();}
 live.onerror=()=>setTimeout(startStream,3000);
 startStream();
@@ -239,7 +319,7 @@ async function refresh(){
       cam+' · '+mo+' · thông báo: '+s.notify+' · '+s.frames+' khung';
     document.getElementById('events').innerHTML=s.events.map(e=>
       '<a href="/events/'+e.file+'" target="_blank"><img src="/events/'+e.file+
-      '"><small>'+e.time+'</small></a>').join('')||'<small>Chưa có.</small>';
+      '"><small>'+e.time+(e.kind==='manual'?' · chụp tay':'')+'</small></a>').join('')||'<small>Chưa có.</small>';
   }catch(e){}
 }
 refresh();setInterval(refresh,2000);
@@ -256,6 +336,11 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+def _events_copy():
+    with events_lock:
+        return list(events)
+
+
 @app.route("/status")
 def status():
     age = time.time() - store.timestamp if store.timestamp else None
@@ -269,7 +354,7 @@ def status():
             "motion_now": state["motion_now"],
             "frames": state["frames"],
             "notify": notifier.describe(),
-            "events": list(events),
+            "events": _events_copy(),
         }
     )
 
@@ -282,6 +367,28 @@ def snapshot():
         abort(404)
 
     return Response(frame, mimetype="image/jpeg")
+
+
+@app.route("/api/snapshot", methods=["POST"])
+def api_snapshot():
+    """Save the current camera picture (no motion needed)."""
+    frame = store.latest()
+    age = time.time() - store.timestamp if store.timestamp else None
+
+    if frame is None or age is None or age > 5:
+        return jsonify({"error": "camera offline - no fresh frame"}), 503
+
+    now = datetime.now()
+    filename = f"snapshot_{now.strftime('%Y%m%d_%H%M%S')}.jpg"
+    tmp = EVENT_DIR / (filename + ".tmp")
+    tmp.write_bytes(frame)
+    tmp.replace(EVENT_DIR / filename)
+
+    add_event(filename, now, None, "manual")
+    cleanup_events()
+    log(f"[snapshot] {filename}")
+
+    return jsonify({"status": "saved", "file": filename}), 200
 
 
 @app.route("/stream")
@@ -391,6 +498,13 @@ def main():
     print(f"Motion        : {'on' if MOTION_ENABLED else 'off'} "
           f"(min area {MOTION_MIN_AREA}px, cooldown {MOTION_COOLDOWN:.0f}s)")
     print(f"Notifications : {notifier.describe()}", flush=True)
+
+    cleanup_events()
+    load_events()
+    print(f"Saved pictures: {len(event_files())} in {EVENT_DIR} "
+          f"(keep {MAX_EVENT_FILES} files / "
+          f"{MAX_EVENT_DAYS:g} days)", flush=True)
+    threading.Thread(target=cleanup_loop, daemon=True).start()
 
     if ESP_STREAM_URL:
         stream_client = StreamClient(ESP_STREAM_URL, on_frame, log=log)
