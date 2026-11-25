@@ -36,6 +36,9 @@ void setup() {
 // ================= LOOP =================
 
 void loop() {
+  // Maintain Wi-Fi connection.
+  maintainWiFi();
+  
   // Camera capture is handled by streamHandler().
   delay(1000);
 }

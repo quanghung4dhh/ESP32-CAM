@@ -8,8 +8,8 @@
 static const unsigned long RECONNECT_INTERVAL = 10000;
 
 // Reconnection management
-unsigned long lastReconnectAttempt = 0;
-bool reconnecting = false;
+static unsigned long lastReconnectAttempt = 0;
+static bool reconnecting = false;
 
 // Initialize Wi-Fi
 bool initWiFi() {
