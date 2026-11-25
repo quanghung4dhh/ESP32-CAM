@@ -104,6 +104,7 @@ pipeline_lock = threading.Lock()
 events = deque(maxlen=24)  # newest first
 events_lock = threading.Lock()
 state = {
+    "motion_enabled": MOTION_ENABLED,
     "motion_now": False,
     "motion_frames": 0,
     "last_alert": 0.0,
@@ -113,6 +114,27 @@ state = {
 
 def log(message):
     print(message, flush=True)
+
+
+def set_motion_enabled(enabled: bool) -> bool:
+    """Enable or disable motion detection at runtime."""
+    enabled = bool(enabled)
+
+    with pipeline_lock:
+        if state["motion_enabled"] == enabled:
+            return True
+
+        state["motion_enabled"] = enabled
+
+        # Reset detection state when changing the mode.
+        state["motion_now"] = False
+        state["motion_frames"] = 0
+        detector.reset()
+
+    log(
+        f"[motion] Detection {'enabled' if enabled else 'disabled'}"
+    )
+    return True
 
 
 # --------------------------------------------------------------- processing
@@ -172,6 +194,54 @@ def add_event(filename, when, area=None, kind="motion"):
             events.remove(old)  # same-second duplicate
 
         events.appendleft(entry)
+
+
+def capture_snapshot():
+    """Save the latest fresh camera frame and return its path."""
+    frame = store.latest()
+    age = time.time() - store.timestamp if store.timestamp else None
+
+    if frame is None or age is None or age > 5:
+        return None
+
+    now = datetime.now()
+    filename = f"snapshot_{now.strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+    path = EVENT_DIR / filename
+    tmp = EVENT_DIR / (filename + ".tmp")
+
+    try:
+        tmp.write_bytes(frame)
+        tmp.replace(path)
+    except OSError as exc:
+        log(f"[snapshot] Save failed: {type(exc).__name__}")
+        return None
+
+    add_event(filename, now, None, "manual")
+    cleanup_events()
+
+    log(f"[snapshot] {filename}")
+    return path
+
+
+def get_system_status():
+    """Return a snapshot of the current system status."""
+    age = time.time() - store.timestamp if store.timestamp else None
+
+    with pipeline_lock:
+        motion_enabled = state["motion_enabled"]
+        motion_now = state["motion_now"]
+        frames = state["frames"]
+
+    return {
+        "camera_online": age is not None and age < 5,
+        "stream_connected": bool(
+            getattr(stream_client, "connected", False)
+        ),
+        "motion_enabled": motion_enabled,
+        "motion_now": motion_now,
+        "frames": frames,
+        "notify": notifier.describe(),
+    }
 
 
 def load_events():
@@ -238,7 +308,7 @@ def on_frame(jpeg: bytes):
     with pipeline_lock:
         state["frames"] += 1
 
-        if not MOTION_ENABLED:
+        if not state["motion_enabled"]:
             return
 
         result, image = detector.process(jpeg)
@@ -343,20 +413,9 @@ def _events_copy():
 
 @app.route("/status")
 def status():
-    age = time.time() - store.timestamp if store.timestamp else None
-
-    return jsonify(
-        {
-            "camera_online": age is not None and age < 5,
-            "stream_connected": bool(
-                getattr(stream_client, "connected", False)
-            ),
-            "motion_now": state["motion_now"],
-            "frames": state["frames"],
-            "notify": notifier.describe(),
-            "events": _events_copy(),
-        }
-    )
+    result = get_system_status()
+    result["events"] = _events_copy()
+    return jsonify(result)
 
 
 @app.route("/snapshot")
@@ -371,24 +430,18 @@ def snapshot():
 
 @app.route("/api/snapshot", methods=["POST"])
 def api_snapshot():
-    """Save the current camera picture (no motion needed)."""
-    frame = store.latest()
-    age = time.time() - store.timestamp if store.timestamp else None
+    """Save the current camera picture."""
+    path = capture_snapshot()
 
-    if frame is None or age is None or age > 5:
-        return jsonify({"error": "camera offline - no fresh frame"}), 503
+    if path is None:
+        return jsonify(
+            {"error": "camera offline - no fresh frame"}
+        ), 503
 
-    now = datetime.now()
-    filename = f"snapshot_{now.strftime('%Y%m%d_%H%M%S')}.jpg"
-    tmp = EVENT_DIR / (filename + ".tmp")
-    tmp.write_bytes(frame)
-    tmp.replace(EVENT_DIR / filename)
-
-    add_event(filename, now, None, "manual")
-    cleanup_events()
-    log(f"[snapshot] {filename}")
-
-    return jsonify({"status": "saved", "file": filename}), 200
+    return jsonify({
+        "status": "saved",
+        "file": path.name,
+    }), 200
 
 
 @app.route("/stream")
@@ -509,6 +562,41 @@ def main():
     if ESP_STREAM_URL:
         stream_client = StreamClient(ESP_STREAM_URL, on_frame, log=log)
         stream_client.start()
+
+    # ------------------------------------------------ Telegram Bot
+
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    if telegram_token and telegram_chat_id:
+        from telegram_bot import TelegramBot
+        from system_controller import SystemController
+
+        controller = SystemController(
+            snapshot_callback=capture_snapshot,
+            send_photo_callback=notifier.send_photo,
+            set_motion_callback=set_motion_enabled,
+            get_status_callback=get_system_status,
+            log=log,
+        )
+
+        telegram_bot = TelegramBot(
+            command_handler=controller.handle_command,
+            log=log,
+        )
+
+        telegram_thread = threading.Thread(
+            target=telegram_bot.run_forever,
+            daemon=True,
+            name="telegram-bot",
+        )
+        telegram_thread.start()
+
+        log("[telegram] Bot started successfully")
+    else:
+        log("[telegram] Bot disabled: missing token or chat ID")
+
+    # ------------------------------------------------ Flask Server
 
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
 

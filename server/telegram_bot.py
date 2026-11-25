@@ -6,6 +6,7 @@ import threading
 import time
 
 import requests
+import json
 
 POLL_TIMEOUT = 25
 REQUEST_TIMEOUT = 35
@@ -66,7 +67,8 @@ class TelegramBot:
 
         params = {
             "timeout": POLL_TIMEOUT,
-            "allowed_updates": ["message"],
+            "allowed_updates": json.dumps(["message"]),
+
         }
 
         if self.offset is not None:
