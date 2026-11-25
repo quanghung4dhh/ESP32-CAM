@@ -1,16 +1,29 @@
 #include "image_processor.h"
 
 #include <Arduino.h>
+#include <math.h>
 
 #include "app_config.h"
-
 // ================= IMAGE PROCESSING =================
 
 uint8_t* ImageProcessor::cropAndScaleRGB565(
     const camera_fb_t* fb,
     float zoom,
     camera_fb_t* outFb) {
-  if (fb == nullptr || fb->format != PIXFORMAT_RGB565) {
+  if (fb == nullptr ||
+      outFb == nullptr ||
+      fb->buf == nullptr ||
+      fb->format != PIXFORMAT_RGB565 ||
+      fb->width == 0 ||
+      fb->height == 0 ||
+      !isfinite(zoom)) {
+    return nullptr;
+  }
+  
+  const size_t requiredLen =
+      (size_t)fb->width * fb->height * sizeof(uint16_t);
+
+  if (fb->len < requiredLen) {
     return nullptr;
   }
 
