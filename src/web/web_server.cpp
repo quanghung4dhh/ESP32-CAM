@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <lwip/sockets.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -51,7 +52,7 @@ static esp_err_t controlHandler(httpd_req_t* req) {
   float zoom = strtof(value, &endPtr);
 
   // Validate input
-  if (endPtr == value || *endPtr != '\0' ||
+  if (endPtr == value || *endPtr != '\0' || !isfinite(zoom) ||
       zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
     httpd_resp_send_err(
         req, HTTPD_400_BAD_REQUEST, "Invalid zoom value");
