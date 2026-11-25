@@ -207,14 +207,22 @@ void startCameraServer() {
         .handler = indexHandler,
         .user_ctx = nullptr};
 
-    httpd_register_uri_handler(controlServer, &indexUri);
+    if (httpd_register_uri_handler(controlServer, &indexUri) != ESP_OK) {
+      Serial.println("Failed to register index URI!");
+      httpd_stop(controlServer);
+      return;
+    }
     httpd_uri_t controlUri = {
         .uri = "/control",
         .method = HTTP_GET,
         .handler = controlHandler,
         .user_ctx = nullptr};
 
-    httpd_register_uri_handler(controlServer, &controlUri);
+    if (httpd_register_uri_handler(controlServer, &controlUri) != ESP_OK) {
+      Serial.println("Failed to register control URI!");
+      httpd_stop(controlServer);
+      return;
+    }
 
     Serial.printf("Control Panel server started on port %u!\n",
                   (unsigned int)CONTROL_PORT);
@@ -245,11 +253,23 @@ void startCameraServer() {
         .handler = streamHandler,
         .user_ctx = nullptr};
 
-    httpd_register_uri_handler(streamServer, &streamUri);
+    if (httpd_register_uri_handler(streamServer, &streamUri) != ESP_OK) {
+      Serial.println("Failed to register stream URI!");
+
+      httpd_stop(streamServer);
+      httpd_stop(controlServer);
+
+      Serial.println("Both servers stopped.");
+      return;
+    }
 
     Serial.printf("Camera stream server started on port %u!\n",
                   (unsigned int)STREAM_PORT);
   } else {
     Serial.println("Failed to start camera stream server!");
+
+    // Stop control server to avoid partial initialization.
+    httpd_stop(controlServer);
+    Serial.println("Control server stopped.");
   }
 }
