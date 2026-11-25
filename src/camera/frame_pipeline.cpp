@@ -18,13 +18,43 @@ FramePipeline::Status FramePipeline::captureJpeg(
     uint8_t** jpgBuf,
     size_t* jpgLen,
     Timings* timings) {
+  // Validate output pointers.
+  if (jpgBuf == nullptr ||
+      jpgLen == nullptr ||
+      timings == nullptr) {
+    return Status::InvalidArgument;
+  }
+
+  // Initialize outputs.
   *jpgBuf = nullptr;
   *jpgLen = 0;
+
+  timings->captureUs = 0;
+  timings->encodeUs = 0;
 
   uint32_t t0 = micros();
 
   // 1. Capture RGB565 frame
   camera_fb_t* fb = esp_camera_fb_get();
+
+  if (fb == nullptr) {
+    Serial.println("Camera capture failed");
+    timings->captureUs = micros() - t0;
+    return Status::CaptureFailed;
+  }
+
+  uint32_t t1 = micros();
+  timings->captureUs = t1 - t0;
+
+  // Validate captured frame.
+  if (fb->buf == nullptr ||
+      fb->width == 0 ||
+      fb->height == 0 ||
+      fb->format != PIXFORMAT_RGB565) {
+    Serial.println("Invalid camera frame");
+    esp_camera_fb_return(fb);
+    return Status::CaptureFailed;
+  }
 
   if (!fb) {
     Serial.println("Camera capture failed");
@@ -32,9 +62,6 @@ FramePipeline::Status FramePipeline::captureJpeg(
     timings->encodeUs = 0;
     return Status::CaptureFailed;
   }
-
-  uint32_t t1 = micros();
-  timings->captureUs = t1 - t0;
 
   // 2. Read current zoom value safely
   float currentZoom = ZoomController::getZoom();

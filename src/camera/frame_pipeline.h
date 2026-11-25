@@ -8,8 +8,9 @@ namespace FramePipeline {
 
 enum class Status {
   Ok,
-  CaptureFailed,  // esp_camera_fb_get() returned nothing
-  EncodeFailed,   // RGB565 -> JPEG conversion failed
+  InvalidArgument,  // Invalid inputs
+  CaptureFailed,    // esp_camera_fb_get() returned nothing
+  EncodeFailed,     // RGB565 -> JPEG conversion failed
 };
 
 struct Timings {
