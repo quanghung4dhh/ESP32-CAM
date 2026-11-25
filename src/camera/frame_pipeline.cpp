@@ -56,10 +56,21 @@ FramePipeline::Status FramePipeline::captureJpeg(
     return Status::CaptureFailed;
   }
 
-  if (!fb) {
-    Serial.println("Camera capture failed");
-    timings->captureUs = micros() - t0;
-    timings->encodeUs = 0;
+  // Validate framebuffer size.
+  // RGB565 requires 2 bytes per pixel.
+  if ((size_t)fb->width >
+      SIZE_MAX / (size_t)fb->height / sizeof(uint16_t)) {
+    Serial.println("Camera frame size overflow");
+    esp_camera_fb_return(fb);
+    return Status::CaptureFailed;
+  }
+
+  const size_t requiredLen =
+      (size_t)fb->width * fb->height * sizeof(uint16_t);
+
+  if (fb->len < requiredLen) {
+    Serial.println("Camera frame buffer too small");
+    esp_camera_fb_return(fb);
     return Status::CaptureFailed;
   }
 
