@@ -15,7 +15,7 @@ class SystemController:
         Callbacks are injected from app.py to avoid circular imports.
 
         snapshot_callback() -> image path or None
-        send_photo_callback(path, caption)
+        send_photo_callback(path, caption, only=None) -> {service: delivered}
         set_motion_callback(enabled: bool) -> bool
         get_status_callback() -> dict
         """
@@ -65,10 +65,19 @@ class SystemController:
         if image_path is None:
             return "Khong the chup anh: camera offline hoac chua co frame."
 
-        self.send_photo_callback(
+        # Answer in the Telegram chat only (not also in Discord)
+        results = self.send_photo_callback(
             str(image_path),
             "Anh chup thu cong tu ESP32-CAM",
+            only="telegram",
         )
+
+        if not (results or {}).get("telegram"):
+            self.log("[controller] Snapshot saved but not delivered")
+            return (
+                "Da chup anh nhung khong gui duoc qua Telegram. "
+                "Anh van duoc luu tren server."
+            )
 
         self.log("[controller] Snapshot sent")
         return "Da chup va gui anh thanh cong."

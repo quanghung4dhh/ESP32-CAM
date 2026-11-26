@@ -1,12 +1,12 @@
 
 """Receive Telegram commands using long polling."""
 
+import json
 import os
+import queue
 import threading
-import time
 
 import requests
-import json
 
 POLL_TIMEOUT = 25
 REQUEST_TIMEOUT = 35
@@ -24,6 +24,9 @@ class TelegramBot:
         self.command_handler = command_handler
         self.stop_event = threading.Event()
         self.offset = None
+        # Commands wait here and are executed one by one by _worker(), so a
+        # slow command (sending a photo) never blocks the polling loop.
+        self.commands = queue.Queue()
 
         if not self.token:
             raise ValueError("Missing TELEGRAM_BOT_TOKEN")
@@ -60,6 +63,26 @@ class TelegramBot:
                 f"[telegram] sendMessage error: {type(exc).__name__}"
             )
             return False
+
+    def skip_pending_updates(self):
+        """Ignore commands that were sent while the server was off."""
+        try:
+            response = requests.get(
+                f"{self.base_url}/getUpdates",
+                params={"offset": -1, "timeout": 0},
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            result = response.json().get("result", [])
+        except (requests.RequestException, ValueError) as exc:
+            self.log(
+                f"[telegram] Could not skip old messages: {type(exc).__name__}"
+            )
+            return
+
+        if result and result[-1].get("update_id") is not None:
+            self.offset = result[-1]["update_id"] + 1
+            self.log("[telegram] Ignored commands sent while the server was off")
 
     def get_updates(self):
         """Fetch new updates from Telegram."""
@@ -120,18 +143,38 @@ class TelegramBot:
             return
 
         self.log(f"[telegram] Received command: {command}")
+        self.commands.put((chat_id, command, message))
 
-        if self.command_handler:
-            reply = self.command_handler(command, message)
-        else:
-            reply = f"Da nhan lenh: {command}"
+    def _worker(self):
+        """Run queued commands one at a time (keeps their order)."""
+        while not self.stop_event.is_set():
+            try:
+                chat_id, command, message = self.commands.get(timeout=1)
+            except queue.Empty:
+                continue
 
-        if reply:
-            self.send_message(chat_id, reply)
+            try:
+                if self.command_handler:
+                    reply = self.command_handler(command, message)
+                else:
+                    reply = f"Da nhan lenh: {command}"
+
+                if reply:
+                    self.send_message(chat_id, reply)
+            except Exception as exc:
+                self.log(
+                    f"[telegram] Command {command} failed: "
+                    f"{type(exc).__name__}"
+                )
 
     def run_forever(self):
         """Continuously poll Telegram for new messages."""
         self.log("[telegram] Bot polling started")
+
+        threading.Thread(
+            target=self._worker, daemon=True, name="telegram-commands"
+        ).start()
+        self.skip_pending_updates()
 
         while not self.stop_event.is_set():
             try:

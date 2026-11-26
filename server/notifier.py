@@ -63,23 +63,32 @@ class Notifier:
 
         return ", ".join(targets) if targets else "none (images are only saved)"
 
-    def send_photo(self, jpeg_path: str, caption: str):
+    def send_photo(self, jpeg_path: str, caption: str, only=None):
         """Send one photo to every configured service.
 
         Each service runs in its own thread, so a slow or failing service
-        does not delay the others. Returns when all of them are done.
+        does not delay the others. Returns when all of them are done, as
+        {"telegram": True/False, "discord": True/False} for the services
+        that were tried (True = the picture was delivered).
+
+        only="telegram" / "discord" limits it to that service.
         """
-        jobs = []
+        jobs = {}
 
-        if self.telegram_enabled:
-            jobs.append(self._telegram)
+        if self.telegram_enabled and only in (None, "telegram"):
+            jobs["telegram"] = self._telegram
 
-        if self.discord_enabled:
-            jobs.append(self._discord)
+        if self.discord_enabled and only in (None, "discord"):
+            jobs["discord"] = self._discord
+
+        results = {}
+
+        def run(name, job):
+            results[name] = bool(job(jpeg_path, caption))
 
         threads = [
-            threading.Thread(target=job, args=(jpeg_path, caption), daemon=True)
-            for job in jobs
+            threading.Thread(target=run, args=(name, job), daemon=True)
+            for name, job in jobs.items()
         ]
 
         for thread in threads:
@@ -87,6 +96,8 @@ class Notifier:
 
         for thread in threads:
             thread.join()
+
+        return results
 
     # ------------------------------------------------------------ Telegram
 
@@ -105,7 +116,7 @@ class Notifier:
 
                 if resp.ok:
                     self.log("[notify] Telegram: sent")
-                    return
+                    return True
 
                 # Do not log the URL: it contains the bot token
                 self.log(
@@ -117,6 +128,8 @@ class Notifier:
                     f"[notify] Telegram error ({type(exc).__name__}), "
                     f"attempt {attempt}/2"
                 )
+
+        return False
 
     # ------------------------------------------------------------- Discord
 
@@ -159,7 +172,7 @@ class Notifier:
 
             if resp.ok:
                 self.log("[notify] Discord: sent")
-                return
+                return True
 
             if resp.status_code == 429:
                 wait = self._retry_after(resp)
@@ -183,7 +196,7 @@ class Notifier:
                     f"[notify] Discord HTTP {resp.status_code}{hint}: "
                     f"{resp.text[:150]}"
                 )
-                return
+                return False
 
             self.log(
                 f"[notify] Discord HTTP {resp.status_code}, "
@@ -191,6 +204,7 @@ class Notifier:
             )
 
         self.log("[notify] Discord: giving up")
+        return False
 
 
 # ------------------------------------------------------------------- test
