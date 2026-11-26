@@ -101,6 +101,27 @@ Lệnh gửi một ảnh thử tới mọi dịch vụ đã cấu hình và in k
 | `SAVE_UPLOADS`                           | `false`     | Lưu mọi ảnh gửi tới `/upload`                                                        |
 | `PORT`                                   | `5000`      | Cổng của server                                                                      |
 
+## Cấu trúc mã nguồn
+
+Chạy bằng `python app.py` (trong thư mục `server/`). Mỗi file một nhiệm vụ,
+khi gặp lỗi chỉ cần mở đúng file:
+
+| File                  | Nhiệm vụ                                                                  |
+| --------------------- | ------------------------------------------------------------------------- |
+| `app.py`              | Điểm vào: tạo Flask, in thông tin khởi động, bật stream và bot Telegram   |
+| `settings.py`         | Đọc biến môi trường / `.env`, đường dẫn thư mục ảnh                       |
+| `runtime.py`          | Đối tượng dùng chung: kho khung hình, notifier, bộ phát hiện, trạng thái  |
+| `motion_pipeline.py`  | Mỗi khung hình mới: phát hiện chuyển động, lưu ảnh, gửi cảnh báo          |
+| `event_store.py`      | Ảnh đã lưu trên đĩa, dọn ảnh cũ, danh sách sự kiện của dashboard          |
+| `camera_ops.py`       | Chụp ảnh, bật/tắt phát hiện chuyển động, lấy trạng thái hệ thống          |
+| `web_routes.py`       | Các đường dẫn HTTP (`/`, `/status`, `/api/...`, `/stream`, `/upload`)     |
+| `web_page.py`         | HTML của dashboard                                                        |
+| `telegram_bot.py`     | Nhận lệnh Telegram (long polling), chỉ nghe đúng `TELEGRAM_CHAT_ID`       |
+| `system_controller.py`| Chuyển lệnh Telegram thành thao tác (`/snapshot`, `/on`, `/off`, ...)     |
+| `notifier.py`         | Gửi ảnh tới Telegram / Discord (`python notifier.py --test`)              |
+| `detector.py`         | Thuật toán phát hiện chuyển động (OpenCV)                                 |
+| `stream_client.py`    | Kéo stream MJPEG từ ESP32-CAM và giữ khung hình mới nhất                  |
+
 ## Lưu ý bảo mật
 
 Server không có đăng nhập. Chỉ chạy trong mạng LAN tin cậy và không mở cổng
