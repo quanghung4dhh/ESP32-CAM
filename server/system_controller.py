@@ -25,6 +25,20 @@ class SystemController:
         self.get_status_callback = get_status_callback
         self.log = log
 
+    # ---- plain actions, used by the Discord bot (Telegram uses handle_command)
+
+    def take_snapshot(self):
+        """Save a picture of the camera; return its path or None (offline)."""
+        return self.snapshot_callback()
+
+    def set_motion(self, enabled):
+        """Turn motion detection on/off; return the reply text."""
+        return self._set_motion(enabled)
+
+    def status_text(self):
+        """Return the system status as text."""
+        return self._status()
+
     def handle_command(self, command, message=None):
         """Dispatch a Telegram command to the corresponding function."""
 

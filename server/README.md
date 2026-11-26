@@ -63,6 +63,41 @@ Webhook URL cho phép bất kỳ ai có nó gửi tin vào kênh của bạn, n�
 như mật khẩu và không commit lên GitHub (`.env` đã nằm trong `.gitignore`).
 Nếu lộ URL, vào lại mục Webhooks và xóa rồi tạo cái mới.
 
+## Lệnh qua Discord (bot)
+
+Webhook ở trên chỉ **gửi** cảnh báo vào kênh. Muốn **điều khiển** camera bằng
+lệnh `/snapshot`, `/status`, `/on`, `/off`, `/help` thì cần thêm một Discord bot
+(miễn phí). Bot kết nối ra ngoài tới Discord nên không cần mở cổng hay IP công
+cộng. Bạn có thể dùng cả webhook lẫn bot.
+
+1. Vào <https://discord.com/developers/applications> → **New Application**, đặt tên.
+2. Mục **Bot** → **Reset Token** → sao chép token → đặt vào `DISCORD_BOT_TOKEN`.
+   Không cần bật mục _Privileged Gateway Intents_ nào.
+3. Mục **OAuth2 → URL Generator**: tick scope `bot` và `applications.commands`;
+   ở _Bot Permissions_ tick `Send Messages` và `Attach Files`. Mở URL tạo ra,
+   chọn server của bạn, bấm **Authorize**.
+4. Bật **Developer Mode**: _User Settings → Advanced → Developer Mode_. Sau đó
+   chuột phải vào **icon server** → _Copy Server ID_ → `DISCORD_GUILD_ID`;
+   chuột phải vào **tên của bạn** → _Copy User ID_ → `DISCORD_ALLOWED_USER_IDS`.
+5. Chạy `pip install -r requirements.txt`, rồi `python app.py`. Log phải có
+   `[discord] Registered 5 slash commands` và `[discord] Bot connected as ...`.
+6. Trong server Discord gõ `/` sẽ thấy các lệnh của bot.
+
+Chỉ người có ID trong `DISCORD_ALLOWED_USER_IDS` dùng được lệnh; người khác bị
+từ chối. Câu trả lời (kể cả ảnh) chỉ mình bạn thấy (_ephemeral_). Không có
+`DISCORD_GUILD_ID` thì lệnh được đăng ký toàn cục và có thể mất tới 1 giờ mới
+hiện. Token bot là bí mật như mật khẩu: không commit, không gửi cho ai; nếu lộ,
+bấm **Reset Token** trong Developer Portal.
+
+| Lỗi trong log                                  | Nguyên nhân                                              |
+| ---------------------------------------------- | -------------------------------------------------------- |
+| `Bot disabled: missing DISCORD_BOT_TOKEN`      | Chưa đặt token                                           |
+| `Bot disabled: discord.py is not installed`    | Chưa chạy `pip install -r requirements.txt`              |
+| `Bot disabled: Missing DISCORD_ALLOWED_USER_IDS` | Chưa đặt ID người dùng được phép                       |
+| `Login failed: DISCORD_BOT_TOKEN is wrong`     | Token sai hoặc đã reset                                  |
+| `Bot error: ..., retry in Ns`                  | Mất mạng hoặc Discord lỗi; bot tự thử lại                |
+| Gõ `/` không thấy lệnh                         | Chưa mời bot với scope `applications.commands`, hoặc sai `DISCORD_GUILD_ID` |
+
 ## Thử thông báo
 
 Không cần chờ có chuyển động, chạy:
@@ -90,6 +125,7 @@ Lệnh gửi một ảnh thử tới mọi dịch vụ đã cấu hình và in k
 | `ESP_CONTROL_URL`                        | tự suy ra   | Địa chỉ điều khiển zoom, mặc định `http://<IP>/control`                              |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | (trống)     | Bật thông báo Telegram                                                               |
 | `DISCORD_WEBHOOK_URL`                    | (trống)     | Bật thông báo Discord (xem "Tạo webhook Discord")                                    |
+| `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_ALLOWED_USER_IDS` | (trống) | Bật bot nhận lệnh Discord (xem "Lệnh qua Discord") |
 | `DISCORD_USERNAME`                       | `ESP32-CAM` | Tên hiển thị của webhook khi gửi tin                                                 |
 | `MOTION_ENABLED`                         | `true`      | Bật/tắt phát hiện chuyển động                                                        |
 | `MOTION_MIN_AREA`                        | `600`       | Diện tích (điểm ảnh) tối thiểu của vùng thay đổi. Tăng nếu báo nhầm, giảm nếu bỏ sót |
@@ -118,6 +154,7 @@ khi gặp lỗi chỉ cần mở đúng file:
 | `web_page.py`         | HTML của dashboard                                                        |
 | `telegram_bot.py`     | Nhận lệnh Telegram (long polling), chỉ nghe đúng `TELEGRAM_CHAT_ID`       |
 | `system_controller.py`| Chuyển lệnh Telegram thành thao tác (`/snapshot`, `/on`, `/off`, ...)     |
+| `discord_bot.py`      | Nhận lệnh Discord (slash commands), chỉ nghe `DISCORD_ALLOWED_USER_IDS`    |
 | `notifier.py`         | Gửi ảnh tới Telegram / Discord (`python notifier.py --test`)              |
 | `detector.py`         | Thuật toán phát hiện chuyển động (OpenCV)                                 |
 | `stream_client.py`    | Kéo stream MJPEG từ ESP32-CAM và giữ khung hình mới nhất                  |

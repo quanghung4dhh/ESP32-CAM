@@ -15,6 +15,7 @@ Modules:
   camera_ops.py       snapshot, motion on/off, status
   web_routes.py       HTTP routes   (HTML page in web_page.py)
   telegram_bot.py     Telegram long polling, system_controller.py: commands
+  discord_bot.py      Discord slash commands (optional, needs discord.py)
   notifier.py         send pictures to Telegram / Discord
   detector.py         motion detection (OpenCV)
   stream_client.py    pulls the ESP32-CAM stream
@@ -46,6 +47,7 @@ from settings import (
     PORT,
 )
 from stream_client import StreamClient
+from system_controller import SystemController
 from web_routes import bp
 
 app = Flask(__name__)
@@ -67,22 +69,24 @@ def get_lan_ip():
         sock.close()
 
 
-def start_telegram_bot():
+def build_controller():
+    """The commands shared by the Telegram and Discord bots."""
+    return SystemController(
+        snapshot_callback=capture_snapshot,
+        send_photo_callback=notifier.send_photo,
+        set_motion_callback=set_motion_enabled,
+        get_status_callback=get_system_status,
+        log=log,
+    )
+
+
+def start_telegram_bot(controller):
     """Start the Telegram command listener if token and chat id are set."""
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
     if telegram_token and telegram_chat_id:
         from telegram_bot import TelegramBot
-        from system_controller import SystemController
-
-        controller = SystemController(
-            snapshot_callback=capture_snapshot,
-            send_photo_callback=notifier.send_photo,
-            set_motion_callback=set_motion_enabled,
-            get_status_callback=get_system_status,
-            log=log,
-        )
 
         telegram_bot = TelegramBot(
             command_handler=controller.handle_command,
@@ -99,6 +103,32 @@ def start_telegram_bot():
         log("[telegram] Bot started successfully")
     else:
         log("[telegram] Bot disabled: missing token or chat ID")
+
+
+def start_discord_bot(controller):
+    """Start the Discord slash-command bot if DISCORD_BOT_TOKEN is set."""
+    if not os.getenv("DISCORD_BOT_TOKEN", "").strip():
+        log("[discord] Bot disabled: missing DISCORD_BOT_TOKEN")
+        return
+
+    try:
+        from discord_bot import DiscordBot
+    except ImportError:
+        log("[discord] Bot disabled: discord.py is not installed "
+            "(pip install -r requirements.txt)")
+        return
+
+    try:
+        discord_bot = DiscordBot(controller, log=log)
+    except ValueError as exc:
+        log(f"[discord] Bot disabled: {exc}")
+        return
+
+    threading.Thread(
+        target=discord_bot.run_forever,
+        daemon=True,
+        name="discord-bot",
+    ).start()
 
 
 def main():
@@ -122,7 +152,9 @@ def main():
         runtime.stream_client = StreamClient(ESP_STREAM_URL, on_frame, log=log)
         runtime.stream_client.start()
 
-    start_telegram_bot()
+    controller = build_controller()
+    start_telegram_bot(controller)
+    start_discord_bot(controller)
 
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
 
